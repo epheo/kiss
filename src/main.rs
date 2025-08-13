@@ -9,7 +9,7 @@ use kiss::{get_mime_type, sanitize_path};
 
 const PORT: u16 = 8080;
 const MAX_REQUEST_SIZE: usize = 8192;
-const STATIC_DIR: &str = "/app/static";
+const STATIC_DIR: &str = ".";
 const MAX_FILE_SIZE: u64 = 50 * 1024 * 1024; // 50MB
 const CONNECTION_TIMEOUT_SECS: u64 = 30;
 const KEEPALIVE_TIMEOUT_SECS: u64 = 5;
@@ -35,7 +35,7 @@ struct HeaderTemplates {
 impl HeaderTemplates {
     fn new() -> Self {
         Self {
-            ok_template: "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\nCache-Control: public, max-age=3600\r\nX-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nContent-Security-Policy: default-src 'self'\r\nConnection: keep-alive\r\n\r\n".to_string(),
+            ok_template: "HTTP/1.1 200 OK\r\nContent-Type: {mime_type}\r\nContent-Length: {content_length}\r\nCache-Control: public, max-age=3600\r\nX-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nContent-Security-Policy: default-src 'self'\r\nConnection: keep-alive\r\n\r\n".to_string(),
             not_found: b"HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nContent-Length: 14\r\nX-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nContent-Security-Policy: default-src 'self'\r\nConnection: keep-alive\r\n\r\nFile not found".to_vec(),
             method_not_allowed: b"HTTP/1.1 405 Method Not Allowed\r\nContent-Type: text/plain\r\nContent-Length: 18\r\nX-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nContent-Security-Policy: default-src 'self'\r\nConnection: keep-alive\r\n\r\nMethod not allowed".to_vec(),
             request_too_large: b"HTTP/1.1 413 Request Entity Too Large\r\nContent-Type: text/plain\r\nContent-Length: 17\r\nX-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nContent-Security-Policy: default-src 'self'\r\nConnection: keep-alive\r\n\r\nRequest too large".to_vec(),
@@ -261,7 +261,9 @@ async fn serve_static_file(stream: &mut TcpStream, path: &str) -> Result<(), Box
             let mime_type = get_mime_type(&file_path);
 
             // Send response headers using template (much faster than format!)
-            let headers = HEADER_TEMPLATES.ok_template.replace("{}", mime_type).replace("{}", &file_size.to_string());
+            let headers = HEADER_TEMPLATES.ok_template
+                .replace("{mime_type}", mime_type)
+                .replace("{content_length}", &file_size.to_string());
             stream.write_all(headers.as_bytes()).await?;
 
             // Zero-copy file serving - direct kernel-to-kernel transfer

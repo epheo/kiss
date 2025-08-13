@@ -5,7 +5,7 @@ FROM rust:1.75-alpine AS builder
 RUN apk add --no-cache musl-dev
 RUN rustup target add x86_64-unknown-linux-musl
 
-# Create app directory
+# Set working directory
 WORKDIR /app
 
 # Copy Cargo files

@@ -213,16 +213,88 @@ mod http_response_validation_tests {
                 // Should have Content-Length header
                 assert!(response.contains("Content-Length:"), "Missing Content-Length header");
                 
-                // Just verify content length is present and valid
-                if let Some(length_line) = response.lines().find(|line| line.starts_with("Content-Length:")) {
+                // Verify content length matches actual body size
+                let (headers_str, body) = split_http_response(&response);
+                if let Some(length_line) = headers_str.lines().find(|line| line.starts_with("Content-Length:")) {
                     let length_str = length_line.split(": ").nth(1).unwrap_or("0");
                     let content_length: usize = length_str.parse().unwrap_or(0);
                     assert!(content_length > 0, "Content-Length should be > 0");
+                    assert_eq!(content_length, body.len(), 
+                              "Content-Length ({}) should match actual body size ({})", 
+                              content_length, body.len());
                 }
             }
             Err(_) => {
                 println!("Warning: Server not running, skipping content length test");
             }
+        }
+    }
+
+    #[test]
+    #[ignore] // Requires server to be running and test files
+    fn test_content_length_accuracy_static_files() {
+        // Test files with known byte sizes
+        let test_cases = [
+            ("/test_content.html", 192, "text/html; charset=utf-8"),
+            ("/test_style.css", 67, "text/css; charset=utf-8"), 
+            ("/test_script.js", 57, "text/javascript; charset=utf-8"),
+        ];
+        
+        for (path, expected_size, expected_content_type) in &test_cases {
+            let request = format!("GET {} HTTP/1.1\r\nHost: localhost\r\n\r\n", path);
+            match send_raw_request(&request) {
+                Ok(response) => {
+                    if response.contains("HTTP/1.1 200 OK") {
+                        // Verify Content-Length header exists and is correct
+                        assert!(response.contains("Content-Length:"), 
+                               "Missing Content-Length header for {}", path);
+                        
+                        // Split response into headers and body
+                        let (headers_str, body) = split_http_response(&response);
+                        
+                        // Extract and validate Content-Length header
+                        if let Some(length_line) = headers_str.lines().find(|line| line.starts_with("Content-Length:")) {
+                            let length_str = length_line.split(": ").nth(1).unwrap_or("0");
+                            let content_length: usize = length_str.parse()
+                                .expect(&format!("Invalid Content-Length header for {}: '{}'", path, length_str));
+                            
+                            // This is the critical test - Content-Length must match actual body size
+                            assert_eq!(content_length, body.len(), 
+                                      "Content-Length header ({}) does not match actual body size ({}) for {}",
+                                      content_length, body.len(), path);
+                            
+                            // Also verify it matches our expected file size
+                            assert_eq!(content_length, *expected_size, 
+                                      "Content-Length ({}) does not match expected file size ({}) for {}",
+                                      content_length, expected_size, path);
+                        } else {
+                            panic!("Content-Length header not found for {}", path);
+                        }
+                        
+                        // Verify Content-Type header is also correct (ensures template replacement works)
+                        assert!(response.contains(&format!("Content-Type: {}", expected_content_type)),
+                               "Wrong Content-Type for {}: expected {}", path, expected_content_type);
+                    } else {
+                        println!("Warning: Test file {} not found, skipping", path);
+                    }
+                }
+                Err(_) => {
+                    println!("Warning: Server not running, skipping content length accuracy test");
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Split HTTP response into headers and body parts
+    fn split_http_response(response: &str) -> (&str, &str) {
+        if let Some(body_start) = response.find("\r\n\r\n") {
+            let headers = &response[..body_start];
+            let body = &response[body_start + 4..];
+            (headers, body)
+        } else {
+            // Fallback if no proper HTTP separator found
+            (response, "")
         }
     }
     

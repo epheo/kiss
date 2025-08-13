@@ -70,6 +70,55 @@ mod http_integration_tests {
     }
     
     #[test]
+    #[ignore] // Requires server to be running and static files
+    fn test_serve_html_file() {
+        match send_get_request("/index.html") {
+            Ok(response) => {
+                assert!(response.contains("HTTP/1.1 200 OK"));
+                assert!(response.contains("Content-Type: text/html"));
+                assert!(response.contains("<html>"));
+            }
+            Err(_) => {
+                println!("Warning: Server not running, skipping integration test");
+            }
+        }
+    }
+    
+    #[test]
+    #[ignore] // Requires server to be running and static files
+    fn test_serve_different_file_types() {
+        // Test CSS file
+        match send_get_request("/style.css") {
+            Ok(response) => {
+                if response.contains("HTTP/1.1 200 OK") {
+                    assert!(response.contains("Content-Type: text/css"));
+                } else {
+                    // File might not exist, that's ok for this test
+                    assert!(response.contains("HTTP/1.1 404 Not Found"));
+                }
+            }
+            Err(_) => {
+                println!("Warning: Server not running, skipping integration test");
+            }
+        }
+        
+        // Test JavaScript file
+        match send_get_request("/app.js") {
+            Ok(response) => {
+                if response.contains("HTTP/1.1 200 OK") {
+                    assert!(response.contains("Content-Type: application/javascript"));
+                } else {
+                    // File might not exist, that's ok for this test
+                    assert!(response.contains("HTTP/1.1 404 Not Found"));
+                }
+            }
+            Err(_) => {
+                println!("Warning: Server not running, skipping integration test");
+            }
+        }
+    }
+    
+    #[test]
     #[ignore] // Requires server to be running  
     fn test_method_not_allowed() {
         let mut stream = TcpStream::connect("127.0.0.1:8080").unwrap_or_else(|_| {
