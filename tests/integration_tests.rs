@@ -120,6 +120,50 @@ mod http_integration_tests {
         assert!(response.contains("HTTP/1.1 413 Request Entity Too Large"));
         assert!(response.contains("Request too large"));
     }
+
+    #[test]
+    #[ignore] // Requires server to be running from tests/content/
+    fn test_svg_content_type() {
+        match send_get_request("/test.svg") {
+            Ok(response) => {
+                assert!(response.contains("HTTP/1.1 200 OK"));
+                assert!(response.contains("Content-Type: image/svg+xml"));
+                assert!(response.contains("<svg xmlns"));
+                println!("SVG Content-Type test passed: image/svg+xml header found");
+            }
+            Err(_) => {
+                println!("Warning: Server not running from tests/content/, skipping SVG test");
+                println!("To run this test: cd tests/content && ../../target/release/kiss");
+            }
+        }
+    }
+
+    #[test]
+    #[ignore] // Requires server to be running from tests/content/
+    fn test_multiple_content_types() {
+        // Test various file types from tests/content/
+        let test_cases = vec![
+            ("/test.svg", "image/svg+xml"),
+            ("/style.css", "text/css; charset=utf-8"),
+            ("/app.js", "text/javascript; charset=utf-8"),
+            ("/index.html", "text/html; charset=utf-8"),
+        ];
+
+        for (path, expected_content_type) in test_cases {
+            match send_get_request(path) {
+                Ok(response) => {
+                    assert!(response.contains("HTTP/1.1 200 OK"), 
+                        "Failed for {}: Expected 200 OK", path);
+                    assert!(response.contains(&format!("Content-Type: {}", expected_content_type)), 
+                        "Failed for {}: Expected Content-Type: {}", path, expected_content_type);
+                    println!("✓ {} served with correct Content-Type: {}", path, expected_content_type);
+                }
+                Err(_) => {
+                    println!("Warning: Server not running from tests/content/, skipping {}", path);
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
