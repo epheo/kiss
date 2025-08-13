@@ -248,7 +248,8 @@ KISS is designed with security as a primary concern:
 
 ### Container Security
 - **Scratch Base Image**: Minimal attack surface with no OS packages, shell, or utilities
-- **Static Binary**: Single Rust binary with no runtime dependencies
+- **Static Binary**: Single Rust binary (562KB) with no runtime dependencies
+- **Ultra-Lightweight Container**: 706KB total container size
 - **Rootless Operation**: Runs as non-privileged user on both Kubernetes and OpenShift
 - **Read-Only Filesystem**: Compatible with `readOnlyRootFilesystem: true`
 - **No Privilege Escalation**: Designed to run with `allowPrivilegeEscalation: false`

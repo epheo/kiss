@@ -7,7 +7,6 @@ This document provides performance analysis (measured on my laptop) and benchmar
 - **Peak Throughput**: 129,647 req/s
 - **Sustained Capacity**: 82,510 req/s  
 - **Average Response Time**: 0.70ms
-- **Memory Footprint**: ~50MB base, <1KB per connection
 - **Scalability**: Linear horizontal scaling in Kubernetes
 
 ## Performance Benchmarks
