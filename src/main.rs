@@ -183,7 +183,7 @@ async fn handle_connection_inner(stream: &mut TcpStream) -> Result<(), Box<dyn s
             }
         };
 
-        if method != b"GET" {
+        if method != b"GET" && method != b"HEAD" {
             send_precompiled_response(stream, &HEADER_TEMPLATES.method_not_allowed).await?;
             break;
         }
@@ -212,7 +212,8 @@ async fn handle_connection_inner(stream: &mut TcpStream) -> Result<(), Box<dyn s
         }
 
         // Handle the request
-        match handle_request(stream, path).await {
+        let is_head = method == b"HEAD";
+        match handle_request(stream, path, is_head).await {
             Ok(_) => {
                 if !keep_alive {
                     break;
@@ -225,20 +226,20 @@ async fn handle_connection_inner(stream: &mut TcpStream) -> Result<(), Box<dyn s
     Ok(())
 }
 
-async fn handle_request(stream: &mut TcpStream, path: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn handle_request(stream: &mut TcpStream, path: &str, is_head: bool) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Handle health check endpoints
     if path == "/health" {
-        return send_health_response(stream).await;
+        return send_health_response(stream, is_head).await;
     }
 
     if path == "/ready" {
-        return send_ready_response(stream).await;
+        return send_ready_response(stream, is_head).await;
     }
 
-    serve_static_file(stream, path).await
+    serve_static_file(stream, path, is_head).await
 }
 
-async fn serve_static_file(stream: &mut TcpStream, path: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn serve_static_file(stream: &mut TcpStream, path: &str, is_head: bool) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let sanitized_path = sanitize_path(path);
     let file_path = if sanitized_path == "/" {
         format!("{}/index.html", STATIC_DIR)
@@ -266,8 +267,11 @@ async fn serve_static_file(stream: &mut TcpStream, path: &str) -> Result<(), Box
                 .replace("{content_length}", &file_size.to_string());
             stream.write_all(headers.as_bytes()).await?;
 
-            // Zero-copy file serving - direct kernel-to-kernel transfer
-            tokio::io::copy(&mut file, stream).await?;
+            // For HEAD requests, only send headers, not the file content
+            if !is_head {
+                // Zero-copy file serving - direct kernel-to-kernel transfer
+                tokio::io::copy(&mut file, stream).await?;
+            }
             stream.flush().await?;
         }
         Err(_) => {
@@ -288,7 +292,7 @@ async fn send_precompiled_response(
     Ok(())
 }
 
-async fn send_health_response(stream: &mut TcpStream) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn send_health_response(stream: &mut TcpStream, is_head: bool) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -303,12 +307,14 @@ async fn send_health_response(stream: &mut TcpStream) -> Result<(), Box<dyn std:
     );
     
     stream.write_all(headers.as_bytes()).await?;
-    stream.write_all(health_status.as_bytes()).await?;
+    if !is_head {
+        stream.write_all(health_status.as_bytes()).await?;
+    }
     stream.flush().await?;
     Ok(())
 }
 
-async fn send_ready_response(stream: &mut TcpStream) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn send_ready_response(stream: &mut TcpStream, is_head: bool) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -323,7 +329,9 @@ async fn send_ready_response(stream: &mut TcpStream) -> Result<(), Box<dyn std::
     );
     
     stream.write_all(headers.as_bytes()).await?;
-    stream.write_all(ready_status.as_bytes()).await?;
+    if !is_head {
+        stream.write_all(ready_status.as_bytes()).await?;
+    }
     stream.flush().await?;
     Ok(())
 }
