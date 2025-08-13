@@ -1,0 +1,171 @@
+Kubernetes Instant Static Server
+================================
+
+-- Keep It Simple Stupid
+
+This is a minimalistic container that aims as serving static files behind a k8s ingress 
+controller.
+
+## What KISS Does NOT Implement (By Design)
+
+The following features are deliberately omitted from KISS because they are handled by the Kubernetes ingress controller:
+
+- **TLS/SSL Termination** - Ingress handles certificates, encryption, and HTTPS
+- **Load Balancing** - Ingress distributes traffic across multiple KISS pods  
+- **Domain Routing** - Ingress routes based on hostnames and paths
+- **Rate Limiting** - Ingress can throttle requests before they reach KISS
+- **Authentication** - Ingress handles OAuth, JWT validation, etc.
+- **Compression** - Ingress can add gzip/brotli compression
+- **HTTP/2 & HTTP/3** - Ingress provides modern protocol support
+- **URL Rewriting** - Ingress handles path manipulation and redirects
+
+This division follows cloud-native principles where each component has a single responsibility, reducing complexity and attack surface.
+
+## Usage
+
+```
+podman run -p 8080:8080 --read-only -v /path/to/static:/app/static:ro kiss:latest
+```
+
+### Health Checks
+
+The server provides endpoints for Kubernetes probes:
+
+```bash
+curl http://localhost:8080/health   # Health check
+curl http://localhost:8080/ready    # Readiness check
+```
+
+## Platform Compatibility
+
+KISS is designed to run as a rootless container on both vanilla Kubernetes and OpenShift.
+
+### Vanilla Kubernetes
+
+Works with any SecurityContext that specifies a non-root user:
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kiss-server
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: kiss-server
+  template:
+    metadata:
+      labels:
+        app: kiss-server
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        runAsGroup: 65534
+        fsGroup: 65534
+      containers:
+      - name: kiss
+        image: kiss:latest
+        ports:
+        - containerPort: 8080
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop:
+            - ALL
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 8080
+        volumeMounts:
+        - name: static-files
+          mountPath: /app/static
+          readOnly: true
+      volumes:
+      - name: static-files
+        configMap:
+          name: static-content
+```
+
+### OpenShift
+
+Compatible with OpenShift's default `restricted-v2` Security Context Constraint:
+
+- **Arbitrary UID Assignment**: OpenShift assigns random UIDs (1000000000+ range) but always uses GID 0 (root group)
+- **No USER Directive**: Container allows OpenShift to assign any UID
+- **Default Permissions**: Standard directory permissions (755) provide sufficient read access
+- **Read-Only Operations**: Server only reads files, never writes to filesystem
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kiss-server
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: kiss-server
+  template:
+    metadata:
+      labels:
+        app: kiss-server
+    spec:
+      containers:
+      - name: kiss
+        image: kiss:latest
+        ports:
+        - containerPort: 8080
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop:
+            - ALL
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 8080
+        volumeMounts:
+        - name: static-files
+          mountPath: /app/static
+          readOnly: true
+      volumes:
+      - name: static-files
+        configMap:
+          name: static-content
+```
+
+## Security Features
+
+KISS is designed with security as a primary concern:
+
+### Container Security
+- **Scratch Base Image**: Minimal attack surface with no OS packages, shell, or utilities
+- **Static Binary**: Single Rust binary with no runtime dependencies
+- **Rootless Operation**: Runs as non-privileged user on both Kubernetes and OpenShift
+- **Read-Only Filesystem**: Compatible with `readOnlyRootFilesystem: true`
+- **No Privilege Escalation**: Designed to run with `allowPrivilegeEscalation: false`
+- **Minimal Capabilities**: Functions with all Linux capabilities dropped
+
+### Network Security  
+- **Non-Privileged Port**: Runs on port 8080 (>1024) for non-root compatibility
+- **Bounded Request Size**: Maximum 8KB request size prevents memory exhaustion
+- **File Size Limits**: 50MB maximum file size served
+- **Path Sanitization**: Prevents directory traversal attacks
+
+### Operational Security
+- **Graceful Shutdown**: Handles SIGTERM/SIGINT for clean container termination
+- **Health Endpoints**: Separate `/health` and `/ready` endpoints for monitoring
+- **Worker Pool**: Bounded connection handling prevents resource exhaustion
+- **No File Writes**: Server only reads files, never modifies filesystem
