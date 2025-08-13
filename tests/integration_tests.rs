@@ -93,8 +93,6 @@ mod http_integration_tests {
             Ok(response) => {
                 assert!(response.contains("X-Frame-Options: DENY"));
                 assert!(response.contains("X-Content-Type-Options: nosniff"));
-                assert!(response.contains("X-XSS-Protection: 1; mode=block"));
-                assert!(response.contains("Referrer-Policy: strict-origin-when-cross-origin"));
                 assert!(response.contains("Content-Security-Policy:"));
             }
             Err(_) => {

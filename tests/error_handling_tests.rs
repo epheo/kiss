@@ -248,27 +248,39 @@ mod resource_exhaustion_tests {
         while start_time.elapsed().as_secs() < 10 {
             match TcpStream::connect("127.0.0.1:8080") {
                 Ok(mut stream) => {
-                    let request = "GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n";
-                    if stream.write_all(request.as_bytes()).is_ok() {
-                        let mut response = String::new();
-                        if stream.read_to_string(&mut response).is_ok() {
-                            if response.contains("HTTP/1.1 200 OK") {
-                                successful_requests += 1;
+                    // Set read timeout to prevent hanging on keep-alive connections
+                    if stream.set_read_timeout(Some(Duration::from_secs(2))).is_ok() {
+                        // Use Connection: close to prevent keep-alive issues in tests
+                        let request = "GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+                        if stream.write_all(request.as_bytes()).is_ok() {
+                            let mut buffer = [0u8; 1024];
+                            match stream.read(&mut buffer) {
+                                Ok(bytes_read) if bytes_read > 0 => {
+                                    let response = String::from_utf8_lossy(&buffer[..bytes_read]);
+                                    if response.contains("HTTP/1.1 200 OK") {
+                                        successful_requests += 1;
+                                    }
+                                }
+                                _ => {}
                             }
                         }
                     }
                 }
-                Err(_) => break,
+                Err(_) => {
+                    // Connection failed, small delay and continue
+                    std::thread::sleep(Duration::from_millis(1));
+                    continue;
+                }
             }
             
-            // Small delay to prevent overwhelming
-            std::thread::sleep(Duration::from_millis(10));
+            // Small delay to prevent overwhelming (reduced for optimized server)
+            std::thread::sleep(Duration::from_millis(5));
         }
         
         println!("Memory usage test: {} successful requests in 10 seconds", successful_requests);
-        // With 10ms delay between requests, max theoretical is ~1000 requests in 10 seconds
-        // Accounting for connection overhead, 80+ requests is reasonable
-        assert!(successful_requests >= 80, "Should handle reasonable load without memory issues (got {})", successful_requests);
+        // With optimized async server and 5ms delay, we should get 500+ requests easily
+        // Setting lower bound to account for system variability
+        assert!(successful_requests >= 200, "Should handle reasonable load without memory issues (got {})", successful_requests);
     }
 }
 

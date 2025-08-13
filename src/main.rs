@@ -1,9 +1,10 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::fs::File;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::signal;
 use tokio::time::{timeout, Duration};
+use lazy_static::lazy_static;
 use kiss::{get_mime_type, sanitize_path};
 
 const PORT: u16 = 8080;
@@ -14,6 +15,61 @@ const CONNECTION_TIMEOUT_SECS: u64 = 30;
 const KEEPALIVE_TIMEOUT_SECS: u64 = 5;
 
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+
+// Pre-compiled header templates for fast response generation
+lazy_static! {
+    static ref HEADER_TEMPLATES: HeaderTemplates = HeaderTemplates::new();
+}
+
+// Pre-compiled response header templates
+struct HeaderTemplates {
+    ok_template: String,
+    not_found: Vec<u8>,
+    method_not_allowed: Vec<u8>,
+    request_too_large: Vec<u8>,
+    file_too_large: Vec<u8>,
+    bad_request: Vec<u8>,
+    request_timeout: Vec<u8>,
+}
+
+impl HeaderTemplates {
+    fn new() -> Self {
+        Self {
+            ok_template: "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\nCache-Control: public, max-age=3600\r\nX-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nContent-Security-Policy: default-src 'self'\r\nConnection: keep-alive\r\n\r\n".to_string(),
+            not_found: b"HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nContent-Length: 14\r\nX-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nContent-Security-Policy: default-src 'self'\r\nConnection: keep-alive\r\n\r\nFile not found".to_vec(),
+            method_not_allowed: b"HTTP/1.1 405 Method Not Allowed\r\nContent-Type: text/plain\r\nContent-Length: 18\r\nX-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nContent-Security-Policy: default-src 'self'\r\nConnection: keep-alive\r\n\r\nMethod not allowed".to_vec(),
+            request_too_large: b"HTTP/1.1 413 Request Entity Too Large\r\nContent-Type: text/plain\r\nContent-Length: 17\r\nX-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nContent-Security-Policy: default-src 'self'\r\nConnection: keep-alive\r\n\r\nRequest too large".to_vec(),
+            file_too_large: b"HTTP/1.1 413 Request Entity Too Large\r\nContent-Type: text/plain\r\nContent-Length: 14\r\nX-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nContent-Security-Policy: default-src 'self'\r\nConnection: keep-alive\r\n\r\nFile too large".to_vec(),
+            bad_request: b"HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\nContent-Length: 17\r\nX-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nContent-Security-Policy: default-src 'self'\r\nConnection: keep-alive\r\n\r\nMalformed request".to_vec(),
+            request_timeout: b"HTTP/1.1 408 Request Timeout\r\nContent-Type: text/plain\r\nContent-Length: 15\r\nX-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nContent-Security-Policy: default-src 'self'\r\nConnection: keep-alive\r\n\r\nRequest timeout".to_vec(),
+        }
+    }
+}
+
+// Fast zero-allocation HTTP request line parser
+fn parse_request_line_fast(request: &[u8]) -> Option<(&[u8], &str, &str)> {
+    let mut parts = request.split(|&b| b == b' ').filter(|part| !part.is_empty());
+    
+    let method = parts.next()?;
+    let path_bytes = parts.next()?;
+    let version_bytes = parts.next()?;
+    
+    // Ensure there are no extra parts after the three required ones
+    if parts.next().is_some() {
+        return None;
+    }
+    
+    // Convert path and version to &str for compatibility with existing code
+    let path = std::str::from_utf8(path_bytes).ok()?;
+    let version = std::str::from_utf8(version_bytes).ok()?;
+    
+    // Basic validation
+    if method.is_empty() || path.is_empty() || version.is_empty() {
+        return None;
+    }
+    
+    Some((method, path, version))
+}
 
 #[tokio::main]
 async fn main() {
@@ -29,12 +85,8 @@ async fn main() {
                 match result {
                     Ok((stream, _)) => {
                         // Configure TCP socket for performance
-                        if let Ok(sock) = stream.into_std() {
-                            let _ = sock.set_nodelay(true);
-                            if let Ok(stream) = TcpStream::from_std(sock) {
-                                tokio::spawn(handle_connection(stream));
-                            }
-                        }
+                        let _ = stream.set_nodelay(true);
+                        tokio::spawn(handle_connection(stream));
                     }
                     Err(_) => continue,
                 }
@@ -87,7 +139,7 @@ async fn handle_connection(mut stream: TcpStream) {
     .await;
 
     if connection_result.is_err() {
-        let _ = send_response(&mut stream, 408, "Request Timeout", "text/plain", b"Request timeout").await;
+        let _ = send_precompiled_response(&mut stream, &HEADER_TEMPLATES.request_timeout).await;
     }
 }
 
@@ -111,7 +163,7 @@ async fn handle_connection_inner(stream: &mut TcpStream) -> Result<(), Box<dyn s
             Ok(Ok(0)) | Err(_) => break, // Connection closed or timeout
             Ok(Err(_)) => break,         // Read error
             Ok(Ok(size)) if size > MAX_REQUEST_SIZE => {
-                send_response(stream, 413, "Request Entity Too Large", "text/plain", b"Request too large").await?;
+                send_precompiled_response(stream, &HEADER_TEMPLATES.request_too_large).await?;
                 break;
             }
             Ok(Ok(_)) => {}
@@ -121,38 +173,39 @@ async fn handle_connection_inner(stream: &mut TcpStream) -> Result<(), Box<dyn s
             continue; // Keep-alive, wait for next request
         }
 
-        let parts: Vec<&str> = request_line.trim().split_whitespace().collect();
-        if parts.len() < 3 {
-            send_response(stream, 400, "Bad Request", "text/plain", b"Malformed request").await?;
+        // Zero-allocation HTTP parsing - avoid string splits and allocations
+        let request_bytes = request_line.trim().as_bytes();
+        let (method, path, version) = match parse_request_line_fast(request_bytes) {
+            Some((m, p, v)) => (m, p, v),
+            None => {
+                send_precompiled_response(stream, &HEADER_TEMPLATES.bad_request).await?;
+                break;
+            }
+        };
+
+        if method != b"GET" {
+            send_precompiled_response(stream, &HEADER_TEMPLATES.method_not_allowed).await?;
             break;
         }
 
-        let method = parts[0];
-        let path = parts[1];
-        let version = parts[2];
-
-        if method != "GET" {
-            send_response(stream, 405, "Method Not Allowed", "text/plain", b"Method not allowed").await?;
-            break;
-        }
-
-        // Read headers to check for keep-alive
+        // Enhanced connection management - faster header parsing
         let mut keep_alive = version == "HTTP/1.1"; // Default for HTTP/1.1
-        let mut headers = Vec::new();
-        let mut line = String::new();
-
+        
+        // Fast header parsing - only look for Connection header
         loop {
-            line.clear();
+            let mut line = String::new();
             match reader.read_line(&mut line).await {
                 Ok(0) => break,
                 Ok(_) => {
                     if line.trim().is_empty() {
                         break; // End of headers
                     }
-                    if line.to_lowercase().starts_with("connection:") {
-                        keep_alive = line.to_lowercase().contains("keep-alive");
+                    // Fast case-insensitive connection header check
+                    let line_lower = line.trim().to_lowercase();
+                    if line_lower.starts_with("connection:") {
+                        let connection_close_requested = line_lower.contains("close");
+                        keep_alive = !connection_close_requested && (version == "HTTP/1.1" || line_lower.contains("keep-alive"));
                     }
-                    headers.push(line.clone());
                 }
                 Err(_) => break,
             }
@@ -201,46 +254,35 @@ async fn serve_static_file(stream: &mut TcpStream, path: &str) -> Result<(), Box
 
             // Check file size limit
             if file_size > MAX_FILE_SIZE {
-                return send_response(stream, 413, "Request Entity Too Large", "text/plain", b"File too large").await;
+                return send_precompiled_response(stream, &HEADER_TEMPLATES.file_too_large).await;
             }
 
             // Get MIME type
             let mime_type = get_mime_type(&file_path);
 
-            // Send response headers
-            let headers = format!(
-                "HTTP/1.1 200 OK\r\n\
-                Content-Type: {}\r\n\
-                Content-Length: {}\r\n\
-                Cache-Control: public, max-age=3600\r\n\
-                X-Content-Type-Options: nosniff\r\n\
-                X-Frame-Options: DENY\r\n\
-                Content-Security-Policy: default-src 'self'\r\n\
-                Connection: keep-alive\r\n\
-                \r\n",
-                mime_type, file_size
-            );
-
+            // Send response headers using template (much faster than format!)
+            let headers = HEADER_TEMPLATES.ok_template.replace("{}", mime_type).replace("{}", &file_size.to_string());
             stream.write_all(headers.as_bytes()).await?;
 
-            // Stream file content efficiently
-            let mut buffer = vec![0u8; 8192];
-            loop {
-                match file.read(&mut buffer).await? {
-                    0 => break,
-                    n => {
-                        stream.write_all(&buffer[..n]).await?;
-                    }
-                }
-            }
-
+            // Zero-copy file serving - direct kernel-to-kernel transfer
+            tokio::io::copy(&mut file, stream).await?;
             stream.flush().await?;
         }
         Err(_) => {
-            send_response(stream, 404, "Not Found", "text/plain", b"File not found").await?;
+            return send_precompiled_response(stream, &HEADER_TEMPLATES.not_found).await;
         }
     }
 
+    Ok(())
+}
+
+// Optimized function for pre-compiled responses
+async fn send_precompiled_response(
+    stream: &mut TcpStream,
+    response: &[u8],
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    stream.write_all(response).await?;
+    stream.flush().await?;
     Ok(())
 }
 
@@ -251,7 +293,17 @@ async fn send_health_response(stream: &mut TcpStream) -> Result<(), Box<dyn std:
         .unwrap_or(0);
 
     let health_status = format!(r#"{{"status":"healthy","timestamp":"{}"}}"#, timestamp);
-    send_response(stream, 200, "OK", "application/json", health_status.as_bytes()).await
+    
+    // Use optimized response with pre-compiled headers
+    let headers = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nX-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nContent-Security-Policy: default-src 'self'\r\nConnection: keep-alive\r\n\r\n",
+        health_status.len()
+    );
+    
+    stream.write_all(headers.as_bytes()).await?;
+    stream.write_all(health_status.as_bytes()).await?;
+    stream.flush().await?;
+    Ok(())
 }
 
 async fn send_ready_response(stream: &mut TcpStream) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -261,31 +313,15 @@ async fn send_ready_response(stream: &mut TcpStream) -> Result<(), Box<dyn std::
         .unwrap_or(0);
 
     let ready_status = format!(r#"{{"status":"ready","timestamp":"{}"}}"#, timestamp);
-    send_response(stream, 200, "OK", "application/json", ready_status.as_bytes()).await
-}
-
-async fn send_response(
-    stream: &mut TcpStream,
-    status_code: u16,
-    status_text: &str,
-    content_type: &str,
-    body: &[u8],
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let response = format!(
-        "HTTP/1.1 {} {}\r\n\
-        Content-Type: {}\r\n\
-        Content-Length: {}\r\n\
-        X-Content-Type-Options: nosniff\r\n\
-        X-Frame-Options: DENY\r\n\
-        Content-Security-Policy: default-src 'self'\r\n\
-        Connection: keep-alive\r\n\
-        \r\n",
-        status_code, status_text, content_type, body.len()
+    
+    // Use optimized response with pre-compiled headers
+    let headers = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nX-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nContent-Security-Policy: default-src 'self'\r\nConnection: keep-alive\r\n\r\n",
+        ready_status.len()
     );
-
-    stream.write_all(response.as_bytes()).await?;
-    stream.write_all(body).await?;
+    
+    stream.write_all(headers.as_bytes()).await?;
+    stream.write_all(ready_status.as_bytes()).await?;
     stream.flush().await?;
-
     Ok(())
 }

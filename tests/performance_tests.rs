@@ -1,3 +1,45 @@
+//! Performance Tests for KISS Static Server
+//! 
+//! This module contains comprehensive performance tests that measure different
+//! aspects of the server's performance characteristics:
+//! 
+//! ## Test Categories:
+//! 
+//! ### 1. Latency Tests (`test_single_request_response_time`)
+//! - **Purpose**: Measure response time distribution and latency characteristics
+//! - **Method**: Sequential requests measuring individual response times
+//! - **Metrics**: Min, max, average, median, 95th percentile response times
+//! - **Target**: <10ms average, <50ms 95th percentile
+//! 
+//! ### 2. Concurrency Scaling Tests (`test_concurrent_request_throughput`)  
+//! - **Purpose**: Test how performance scales with different concurrency levels
+//! - **Method**: Test at 1, 5, 10, 20 concurrent connections
+//! - **Metrics**: Requests per second at each concurrency level
+//! - **Target**: >50 req/s minimum, linear scaling with concurrency
+//! 
+//! ### 3. Sustained Capacity Tests (`test_sustained_capacity`)
+//! - **Purpose**: Measure maximum sustainable throughput over extended periods
+//! - **Method**: Flood test with high concurrency for 30 seconds
+//! - **Metrics**: Sustained requests per second, response time stability
+//! - **Result**: Reports actual sustained capacity (no artificial targets)
+//! 
+//! ### 4. Maximum Throughput Tests (`test_maximum_throughput`)
+//! - **Purpose**: Measure peak performance under maximum stress (comparable to Apache Bench)
+//! - **Method**: High concurrency (100 connections) for maximum throughput
+//! - **Metrics**: Maximum requests per second achieved
+//! - **Target**: >15K req/s (should approach Apache Bench results of ~32K req/s)
+//! 
+//! ### 5. Microbenchmarks (`bench_*` tests)
+//! - **Purpose**: Test performance of individual components (MIME detection, path sanitization)
+//! - **Method**: Isolated component testing with high iteration counts
+//! - **Metrics**: Operations per second for specific functions
+//! - **Target**: Component-specific performance thresholds
+//! 
+//! ## Comparison with External Tools:
+//! - **Apache Bench**: Our `test_maximum_throughput` should approach `ab` results
+//! - **Real-world load**: Our `test_memory_usage_under_load` simulates production usage
+//! - **Component perf**: Our microbenchmarks test individual optimizations
+
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::sync::{Arc, Barrier};
@@ -112,51 +154,49 @@ mod performance_regression_tests {
     
     #[test]
     #[ignore] // Performance test - run manually
-    fn test_memory_usage_under_load() {
+    fn test_sustained_capacity() {
+        // Sustained capacity test: Measure maximum sustainable throughput
         const TEST_DURATION_SECS: u64 = 30;
-        const TARGET_RPS: usize = 10;
+        const CONCURRENCY: usize = 100; // High concurrency to saturate server
+        const REQUESTS_PER_THREAD: usize = 10; // Small batches for continuous flow
+        
+        println!("Starting sustained capacity test: {} concurrent connections for {} seconds", 
+                CONCURRENCY, TEST_DURATION_SECS);
         
         let start_time = Instant::now();
         let mut total_requests = 0;
         let mut successful_requests = 0;
         let mut response_times = Vec::new();
         
+        // Flood test: Send requests continuously without rate limiting
         while start_time.elapsed().as_secs() < TEST_DURATION_SECS {
-            let batch_start = Instant::now();
-            let handles = create_concurrent_requests(TARGET_RPS, 1, "/health");
+            // Send requests as fast as possible - no timing constraints
+            let handles = create_concurrent_requests(CONCURRENCY, REQUESTS_PER_THREAD, "/health");
             
             for handle in handles {
-                total_requests += 1;
+                total_requests += REQUESTS_PER_THREAD;
                 match handle.join() {
-                    Ok(Ok((1, duration))) => {
-                        successful_requests += 1;
-                        response_times.push(duration);
-                    }
                     Ok(Ok((count, duration))) => {
                         successful_requests += count;
                         if count > 0 {
+                            // Average response time for this batch
                             response_times.push(duration / count as u32);
                         }
                     }
-                    _ => {}
+                    Ok(Err(_)) => {}
+                    Err(_) => {}
                 }
             }
-            
-            // Maintain target RPS
-            let batch_duration = batch_start.elapsed();
-            let target_batch_duration = Duration::from_millis(1000);
-            if batch_duration < target_batch_duration {
-                thread::sleep(target_batch_duration - batch_duration);
-            }
+            // No sleep - continuous request sending for maximum throughput
         }
         
         let actual_duration = start_time.elapsed();
         let actual_rps = successful_requests as f64 / actual_duration.as_secs_f64();
         
-        println!("Memory usage test results:");
+        println!("Sustained capacity test results:");
         println!("  Duration: {:?}", actual_duration);
         println!("  Requests: {} successful / {} total", successful_requests, total_requests);
-        println!("  RPS: {:.2}", actual_rps);
+        println!("  Sustained RPS: {:.0}", actual_rps);
         
         if !response_times.is_empty() {
             response_times.sort();
@@ -167,16 +207,100 @@ mod performance_regression_tests {
             println!("  Avg response time: {:?}", avg_response_time);
             println!("  95th percentile: {:?}", p95_response_time);
             
-            // Performance should not degrade over time (no memory leaks)
-            assert!(avg_response_time < Duration::from_millis(100), 
-                   "Average response time degraded: {:?}", avg_response_time);
-            assert!(p95_response_time < Duration::from_millis(500), 
-                   "95th percentile response time too high: {:?}", p95_response_time);
+            // Sustained performance should remain consistent (no memory leaks/degradation)
+            assert!(avg_response_time < Duration::from_millis(10), 
+                   "Average response time degraded under sustained load: {:?}", avg_response_time);
+            assert!(p95_response_time < Duration::from_millis(50), 
+                   "95th percentile response time too high under sustained load: {:?}", p95_response_time);
         }
         
-        // Should maintain reasonable success rate
+        // Should maintain high success rate under sustained load
         let success_rate = successful_requests as f64 / total_requests as f64;
-        assert!(success_rate > 0.90, "Success rate too low: {:.2}%", success_rate * 100.0);
+        assert!(success_rate > 0.95, "Success rate too low under sustained load: {:.2}%", success_rate * 100.0);
+        
+        // Report sustained capacity - no target to validate against
+        println!("✅ Sustained capacity test completed: {:.0} req/s", actual_rps);
+    }
+    
+    #[test]
+    #[ignore] // Performance test - run manually
+    fn test_maximum_throughput() {
+        // Maximum throughput test: Measure peak performance similar to Apache Bench
+        const TEST_DURATION_SECS: u64 = 5; // Shorter test for maximum stress
+        const HIGH_CONCURRENCY: usize = 100;
+        const REQUESTS_PER_THREAD: usize = 100;
+        
+        println!("Starting maximum throughput test: {} concurrent connections for {} seconds", 
+                HIGH_CONCURRENCY, TEST_DURATION_SECS);
+        
+        let start_time = Instant::now();
+        let mut total_successful = 0;
+        let mut total_requests = 0;
+        let mut all_response_times = Vec::new();
+        
+        // Run multiple rounds of high-concurrency requests
+        while start_time.elapsed().as_secs() < TEST_DURATION_SECS {
+            let round_start = Instant::now();
+            let handles = create_concurrent_requests(HIGH_CONCURRENCY, REQUESTS_PER_THREAD, "/health");
+            
+            let mut round_successful = 0;
+            let mut round_response_times = Vec::new();
+            
+            for handle in handles {
+                total_requests += REQUESTS_PER_THREAD;
+                match handle.join() {
+                    Ok(Ok((count, duration))) => {
+                        round_successful += count;
+                        if count > 0 {
+                            // Distribute the total duration across successful requests
+                            let avg_time_per_request = duration / count as u32;
+                            for _ in 0..count {
+                                round_response_times.push(avg_time_per_request);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            
+            total_successful += round_successful;
+            all_response_times.extend(round_response_times);
+            
+            let round_duration = round_start.elapsed();
+            let round_rps = round_successful as f64 / round_duration.as_secs_f64();
+            println!("  Round: {} requests in {:?} ({:.0} req/s)", 
+                    round_successful, round_duration, round_rps);
+        }
+        
+        let total_duration = start_time.elapsed();
+        let max_rps = total_successful as f64 / total_duration.as_secs_f64();
+        
+        println!("Maximum throughput test results:");
+        println!("  Duration: {:?}", total_duration);
+        println!("  Requests: {} successful / {} total", total_successful, total_requests);
+        println!("  Maximum RPS: {:.0}", max_rps);
+        
+        if !all_response_times.is_empty() {
+            all_response_times.sort();
+            let min_time = all_response_times[0];
+            let max_time = all_response_times[all_response_times.len() - 1];
+            let avg_time = all_response_times.iter().sum::<Duration>() / all_response_times.len() as u32;
+            let p95_idx = (all_response_times.len() as f64 * 0.95) as usize;
+            let p95_time = all_response_times[p95_idx.min(all_response_times.len() - 1)];
+            
+            println!("  Response times - Min: {:?}, Avg: {:?}, 95th: {:?}, Max: {:?}", 
+                    min_time, avg_time, p95_time, max_time);
+        }
+        
+        // Performance assertions for maximum throughput
+        let success_rate = total_successful as f64 / total_requests as f64;
+        assert!(success_rate > 0.90, "Success rate too low under max load: {:.2}%", success_rate * 100.0);
+        
+        // Should achieve significant throughput (compare to Apache Bench results)
+        assert!(max_rps > 80000.0, 
+               "Maximum throughput too low: {:.0} req/s (expected >80K)", max_rps);
+        
+        println!("✅ Maximum throughput test passed: {:.0} req/s", max_rps);
     }
     
     #[test]
