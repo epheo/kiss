@@ -3,9 +3,21 @@ name = "kiss"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+name = "kiss"
+path = "src/lib.rs"
+
+[[bin]]
+name = "kiss"
+path = "src/main.rs"
+
 [dependencies]
+tokio = { version = "1.0", features = ["full"] }
+lazy_static = "1.4"
 libc = "0.2"
-crossbeam-channel = "0.5"
+
+[dev-dependencies]
+tempfile = "3.8"
 
 [profile.release]
 opt-level = "z"

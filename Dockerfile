@@ -17,14 +17,8 @@ COPY src ./src
 # Build static binary
 RUN cargo build --release --target x86_64-unknown-linux-musl
 
-# Create static directory for file serving
-RUN mkdir -p /app/static
-
 # Final stage: scratch image
 FROM scratch
-
-# Copy the static directory with OpenShift-compatible permissions
-COPY --from=builder /app/static /app/static
 
 # Copy the static binary
 COPY --from=builder /app/target/x86_64-unknown-linux-musl/release/kiss /kiss

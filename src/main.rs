@@ -1,279 +1,291 @@
-use std::collections::HashMap;
-use std::fs;
-use std::io::{BufRead, BufReader, Write};
-use std::net::{TcpListener, TcpStream};
-use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
-use std::thread;
-use std::time::Duration;
-use crossbeam_channel::{bounded, Receiver};
+use std::sync::atomic::{AtomicBool, Ordering};
+use tokio::fs::File;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::signal;
+use tokio::time::{timeout, Duration};
+use kiss::{get_mime_type, sanitize_path};
 
 const PORT: u16 = 8080;
 const MAX_REQUEST_SIZE: usize = 8192;
 const STATIC_DIR: &str = "/app/static";
-const SHUTDOWN_TIMEOUT_SECS: u64 = 10;
-const MAX_WORKER_THREADS: usize = 30;
 const MAX_FILE_SIZE: u64 = 50 * 1024 * 1024; // 50MB
+const CONNECTION_TIMEOUT_SECS: u64 = 30;
+const KEEPALIVE_TIMEOUT_SECS: u64 = 5;
 
-static SHUTDOWN_FLAG: AtomicBool = AtomicBool::new(false);
+static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
-fn main() {
-    let active_connections = Arc::new(AtomicUsize::new(0));
-    
-    // Setup signal handlers
-    setup_signal_handlers();
-    
-    // Create worker pool
-    let (sender, receiver) = bounded(MAX_WORKER_THREADS);
-    let worker_handles = start_worker_pool(receiver, Arc::clone(&active_connections));
-    
+#[tokio::main]
+async fn main() {
     let listener = TcpListener::bind(format!("0.0.0.0:{}", PORT))
+        .await
         .expect("Failed to bind to address");
-    
-    // Set non-blocking mode for graceful shutdown
-    listener.set_nonblocking(true)
-        .expect("Failed to set non-blocking mode");
-    
-    println!("Server running on http://0.0.0.0:{} with {} workers", PORT, MAX_WORKER_THREADS);
-    
+
+    println!("Async KISS server running on http://0.0.0.0:{}", PORT);
+
     loop {
-        if SHUTDOWN_FLAG.load(Ordering::Relaxed) {
-            break;
-        }
-        
-        match listener.accept() {
-            Ok((stream, addr)) => {
-                // Try to send to worker pool, drop connection if pool is full
-                if sender.try_send(stream).is_err() {
-                    // Pool is full, send 503 Service Unavailable
-                    if let Ok(mut rejected_stream) = TcpStream::connect(addr) {
-                        let _ = send_response(&mut rejected_stream, 503, "Service Unavailable", "text/plain", b"Server busy, try again later");
+        tokio::select! {
+            result = listener.accept() => {
+                match result {
+                    Ok((stream, _)) => {
+                        // Configure TCP socket for performance
+                        if let Ok(sock) = stream.into_std() {
+                            let _ = sock.set_nodelay(true);
+                            if let Ok(stream) = TcpStream::from_std(sock) {
+                                tokio::spawn(handle_connection(stream));
+                            }
+                        }
                     }
+                    Err(_) => continue,
                 }
             }
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                thread::sleep(Duration::from_millis(100));
-                continue;
+            _ = shutdown_signal() => {
+                println!("Shutdown signal received, stopping server...");
+                SHUTDOWN.store(true, Ordering::Relaxed);
+                break;
             }
-            Err(_) => continue,
         }
-    }
-    
-    println!("Shutting down gracefully...");
-    drop(sender); // Signal workers to stop
-    graceful_shutdown(active_connections, worker_handles);
-}
 
-fn setup_signal_handlers() {
-    unsafe {
-        libc::signal(libc::SIGTERM, signal_handler as libc::sighandler_t);
-        libc::signal(libc::SIGINT, signal_handler as libc::sighandler_t);
-    }
-}
-
-extern "C" fn signal_handler(_: libc::c_int) {
-    SHUTDOWN_FLAG.store(true, Ordering::Relaxed);
-}
-
-fn start_worker_pool(receiver: Receiver<TcpStream>, active_connections: Arc<AtomicUsize>) -> Vec<thread::JoinHandle<()>> {
-    let mut handles = Vec::with_capacity(MAX_WORKER_THREADS);
-    
-    for _ in 0..MAX_WORKER_THREADS {
-        let receiver = receiver.clone();
-        let connections = Arc::clone(&active_connections);
-        
-        let handle = thread::spawn(move || {
-            while let Ok(stream) = receiver.recv() {
-                connections.fetch_add(1, Ordering::Relaxed);
-                handle_connection(stream);
-                connections.fetch_sub(1, Ordering::Relaxed);
-            }
-        });
-        
-        handles.push(handle);
-    }
-    
-    handles
-}
-
-fn graceful_shutdown(active_connections: Arc<AtomicUsize>, worker_handles: Vec<thread::JoinHandle<()>>) {
-    let start = std::time::Instant::now();
-    
-    // Wait for active connections to finish
-    while active_connections.load(Ordering::Relaxed) > 0 {
-        if start.elapsed().as_secs() > SHUTDOWN_TIMEOUT_SECS {
-            println!("Shutdown timeout reached, forcing exit");
+        if SHUTDOWN.load(Ordering::Relaxed) {
             break;
         }
-        
-        println!("Waiting for {} active connections to finish", 
-                active_connections.load(Ordering::Relaxed));
-        thread::sleep(Duration::from_millis(500));
     }
-    
-    // Wait for worker threads to finish
-    for handle in worker_handles {
-        let _ = handle.join();
-    }
-    
+
     println!("Server shutdown complete");
 }
 
-fn handle_connection(mut stream: TcpStream) {
-    let mut reader = BufReader::new(&stream);
-    let mut request_line = String::new();
-    
-    if reader.read_line(&mut request_line).is_err() {
-        return;
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        signal::unix::signal(signal::unix::SignalKind::terminate())
+            .expect("failed to install signal handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
     }
-    
-    if request_line.len() > MAX_REQUEST_SIZE {
-        send_response(&mut stream, 413, "Request Entity Too Large", "text/plain", b"Request too large");
-        return;
-    }
-    
-    let parts: Vec<&str> = request_line.trim().split_whitespace().collect();
-    if parts.len() < 3 || parts[0] != "GET" {
-        send_response(&mut stream, 405, "Method Not Allowed", "text/plain", b"Method not allowed");
-        return;
-    }
-    
-    let path = parts[1];
-    
-    // Handle health check endpoints
-    if path == "/health" {
-        send_health_response(&mut stream);
-        return;
-    }
-    
-    if path == "/ready" {
-        send_ready_response(&mut stream);
-        return;
-    }
-    
-    serve_static_file(&mut stream, path);
 }
 
-fn serve_static_file(stream: &mut TcpStream, path: &str) {
+async fn handle_connection(mut stream: TcpStream) {
+    // Set connection timeout
+    let connection_result = timeout(
+        Duration::from_secs(CONNECTION_TIMEOUT_SECS),
+        handle_connection_inner(&mut stream),
+    )
+    .await;
+
+    if connection_result.is_err() {
+        let _ = send_response(&mut stream, 408, "Request Timeout", "text/plain", b"Request timeout").await;
+    }
+}
+
+async fn handle_connection_inner(stream: &mut TcpStream) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    loop {
+        // Check for shutdown
+        if SHUTDOWN.load(Ordering::Relaxed) {
+            break;
+        }
+
+        let mut reader = BufReader::new(&mut *stream);
+        let mut request_line = String::new();
+
+        // Read request line with timeout
+        match timeout(
+            Duration::from_secs(KEEPALIVE_TIMEOUT_SECS),
+            reader.read_line(&mut request_line),
+        )
+        .await
+        {
+            Ok(Ok(0)) | Err(_) => break, // Connection closed or timeout
+            Ok(Err(_)) => break,         // Read error
+            Ok(Ok(size)) if size > MAX_REQUEST_SIZE => {
+                send_response(stream, 413, "Request Entity Too Large", "text/plain", b"Request too large").await?;
+                break;
+            }
+            Ok(Ok(_)) => {}
+        }
+
+        if request_line.trim().is_empty() {
+            continue; // Keep-alive, wait for next request
+        }
+
+        let parts: Vec<&str> = request_line.trim().split_whitespace().collect();
+        if parts.len() < 3 {
+            send_response(stream, 400, "Bad Request", "text/plain", b"Malformed request").await?;
+            break;
+        }
+
+        let method = parts[0];
+        let path = parts[1];
+        let version = parts[2];
+
+        if method != "GET" {
+            send_response(stream, 405, "Method Not Allowed", "text/plain", b"Method not allowed").await?;
+            break;
+        }
+
+        // Read headers to check for keep-alive
+        let mut keep_alive = version == "HTTP/1.1"; // Default for HTTP/1.1
+        let mut headers = Vec::new();
+        let mut line = String::new();
+
+        loop {
+            line.clear();
+            match reader.read_line(&mut line).await {
+                Ok(0) => break,
+                Ok(_) => {
+                    if line.trim().is_empty() {
+                        break; // End of headers
+                    }
+                    if line.to_lowercase().starts_with("connection:") {
+                        keep_alive = line.to_lowercase().contains("keep-alive");
+                    }
+                    headers.push(line.clone());
+                }
+                Err(_) => break,
+            }
+        }
+
+        // Handle the request
+        match handle_request(stream, path).await {
+            Ok(_) => {
+                if !keep_alive {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+
+    Ok(())
+}
+
+async fn handle_request(stream: &mut TcpStream, path: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Handle health check endpoints
+    if path == "/health" {
+        return send_health_response(stream).await;
+    }
+
+    if path == "/ready" {
+        return send_ready_response(stream).await;
+    }
+
+    serve_static_file(stream, path).await
+}
+
+async fn serve_static_file(stream: &mut TcpStream, path: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let sanitized_path = sanitize_path(path);
     let file_path = if sanitized_path == "/" {
         format!("{}/index.html", STATIC_DIR)
     } else {
         format!("{}{}", STATIC_DIR, sanitized_path)
     };
-    
-    // Check file size before reading
-    match fs::metadata(&file_path) {
-        Ok(metadata) => {
-            if metadata.len() > MAX_FILE_SIZE {
-                send_response(stream, 413, "Payload Too Large", "text/plain", b"File too large");
-                return;
+
+    match File::open(&file_path).await {
+        Ok(mut file) => {
+            // Get file metadata
+            let metadata = file.metadata().await?;
+            let file_size = metadata.len();
+
+            // Check file size limit
+            if file_size > MAX_FILE_SIZE {
+                return send_response(stream, 413, "Request Entity Too Large", "text/plain", b"File too large").await;
             }
-            
-            match fs::read(&file_path) {
-                Ok(contents) => {
-                    let mime_type = get_mime_type(&file_path);
-                    send_response(stream, 200, "OK", &mime_type, &contents);
-                }
-                Err(_) => {
-                    send_response(stream, 404, "Not Found", "text/plain", b"File not found");
+
+            // Get MIME type
+            let mime_type = get_mime_type(&file_path);
+
+            // Send response headers
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\n\
+                Content-Type: {}\r\n\
+                Content-Length: {}\r\n\
+                Cache-Control: public, max-age=3600\r\n\
+                X-Content-Type-Options: nosniff\r\n\
+                X-Frame-Options: DENY\r\n\
+                Content-Security-Policy: default-src 'self'\r\n\
+                Connection: keep-alive\r\n\
+                \r\n",
+                mime_type, file_size
+            );
+
+            stream.write_all(headers.as_bytes()).await?;
+
+            // Stream file content efficiently
+            let mut buffer = vec![0u8; 8192];
+            loop {
+                match file.read(&mut buffer).await? {
+                    0 => break,
+                    n => {
+                        stream.write_all(&buffer[..n]).await?;
+                    }
                 }
             }
+
+            stream.flush().await?;
         }
         Err(_) => {
-            send_response(stream, 404, "Not Found", "text/plain", b"File not found");
+            send_response(stream, 404, "Not Found", "text/plain", b"File not found").await?;
         }
     }
+
+    Ok(())
 }
 
-fn sanitize_path(path: &str) -> String {
-    let path = path.split('?').next().unwrap_or(path);
-    let path = path.split('#').next().unwrap_or(path);
-    
-    let normalized = Path::new(path)
-        .components()
-        .filter_map(|component| {
-            match component {
-                std::path::Component::Normal(s) => s.to_str(),
-                std::path::Component::RootDir => Some("/"),
-                _ => None,
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("/");
-    
-    if normalized.is_empty() || normalized == "/" {
-        "/".to_string()
-    } else if normalized.starts_with('/') {
-        normalized
-    } else {
-        format!("/{}", normalized)
-    }
+async fn send_health_response(stream: &mut TcpStream) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    let health_status = format!(r#"{{"status":"healthy","timestamp":"{}"}}"#, timestamp);
+    send_response(stream, 200, "OK", "application/json", health_status.as_bytes()).await
 }
 
-fn get_mime_type(file_path: &str) -> String {
-    let mime_types: HashMap<&str, &str> = [
-        ("html", "text/html; charset=utf-8"),
-        ("htm", "text/html; charset=utf-8"),
-        ("css", "text/css; charset=utf-8"),
-        ("js", "text/javascript; charset=utf-8"),
-        ("json", "application/json; charset=utf-8"),
-        ("xml", "application/xml; charset=utf-8"),
-        ("txt", "text/plain; charset=utf-8"),
-        ("ico", "image/x-icon"),
-        ("png", "image/png"),
-        ("jpg", "image/jpeg"),
-        ("jpeg", "image/jpeg"),
-        ("gif", "image/gif"),
-        ("svg", "image/svg+xml"),
-        ("pdf", "application/pdf"),
-        ("woff", "font/woff"),
-        ("woff2", "font/woff2"),
-        ("ttf", "font/ttf"),
-        ("eot", "application/vnd.ms-fontobject"),
-    ].iter().cloned().collect();
-    
-    if let Some(extension) = Path::new(file_path).extension().and_then(|s| s.to_str()) {
-        mime_types.get(extension.to_lowercase().as_str())
-            .unwrap_or(&"application/octet-stream")
-            .to_string()
-    } else {
-        "application/octet-stream".to_string()
-    }
+async fn send_ready_response(stream: &mut TcpStream) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    let ready_status = format!(r#"{{"status":"ready","timestamp":"{}"}}"#, timestamp);
+    send_response(stream, 200, "OK", "application/json", ready_status.as_bytes()).await
 }
 
-fn send_response(stream: &mut TcpStream, status_code: u16, status_text: &str, content_type: &str, body: &[u8]) {
-    let security_headers = [
-        "X-Frame-Options: DENY",
-        "X-Content-Type-Options: nosniff",
-        "X-XSS-Protection: 1; mode=block",
-        "Referrer-Policy: strict-origin-when-cross-origin",
-        "Content-Security-Policy: default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline' https://duckduckgo.com"
-    ].join("\r\n");
-    
+async fn send_response(
+    stream: &mut TcpStream,
+    status_code: u16,
+    status_text: &str,
+    content_type: &str,
+    body: &[u8],
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let response = format!(
-        "HTTP/1.1 {} {}\r\n{}\r\nContent-Type: {}\r\nContent-Length: {}\r\n\r\n",
-        status_code, status_text, security_headers, content_type, body.len()
+        "HTTP/1.1 {} {}\r\n\
+        Content-Type: {}\r\n\
+        Content-Length: {}\r\n\
+        X-Content-Type-Options: nosniff\r\n\
+        X-Frame-Options: DENY\r\n\
+        Content-Security-Policy: default-src 'self'\r\n\
+        Connection: keep-alive\r\n\
+        \r\n",
+        status_code, status_text, content_type, body.len()
     );
-    
-    let _ = stream.write_all(response.as_bytes());
-    let _ = stream.write_all(body);
-    let _ = stream.flush();
-}
 
-fn send_health_response(stream: &mut TcpStream) {
-    let health_status = r#"{"status":"healthy","timestamp":"#.to_string() + 
-        &std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs().to_string() + 
-        r#"}"#;
-    
-    send_response(stream, 200, "OK", "application/json", health_status.as_bytes());
-}
+    stream.write_all(response.as_bytes()).await?;
+    stream.write_all(body).await?;
+    stream.flush().await?;
 
-fn send_ready_response(stream: &mut TcpStream) {
-    let ready_status = r#"{"status":"ready","timestamp":"#.to_string() + 
-        &std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs().to_string() + 
-        r#"}"#;
-    
-    send_response(stream, 200, "OK", "application/json", ready_status.as_bytes());
+    Ok(())
 }
