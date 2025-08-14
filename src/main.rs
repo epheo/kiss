@@ -7,7 +7,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::signal;
 use tokio::time::{timeout, Duration};
-use lazy_static::lazy_static;
+use once_cell::sync::OnceCell;
 use kiss::{get_mime_type_enum, sanitize_path};
 
 const PORT: u16 = 8080;
@@ -20,7 +20,7 @@ const KEEPALIVE_TIMEOUT_SECS: u64 = 5;
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
 // Optimized file metadata - pre-computed headers and paths for zero request overhead
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct FileMetadata {
     headers: Vec<u8>,                // Pre-generated complete HTTP headers (biggest win)
     file_path: String,               // Pre-computed file path (eliminates string building)
@@ -29,13 +29,12 @@ struct FileMetadata {
     etag: String,                    // Keep for conditional logic
 }
 
-// Pre-compiled header templates for fast response generation
-lazy_static! {
-    static ref HEADER_TEMPLATES: HeaderTemplates = HeaderTemplates::new();
-    static ref FILE_CACHE: HashMap<String, FileMetadata> = build_file_cache();
-}
+// Static storage for header templates and file cache - initialized at startup
+static HEADER_TEMPLATES: OnceCell<HeaderTemplates> = OnceCell::new();
+static FILE_CACHE: OnceCell<HashMap<String, FileMetadata>> = OnceCell::new();
 
 // Pre-compiled response header templates
+#[derive(Debug)]
 struct HeaderTemplates {
     _ok_template: String,
     not_found: Vec<u8>,
@@ -338,6 +337,14 @@ fn format_http_date(time: SystemTime) -> String {
 
 #[tokio::main]
 async fn main() {
+    // Initialize header templates and file cache at startup - not on first request
+    HEADER_TEMPLATES.set(HeaderTemplates::new())
+        .expect("Failed to initialize header templates");
+    
+    let cache = build_file_cache();
+    FILE_CACHE.set(cache)
+        .expect("Failed to initialize file cache");
+
     let listener = TcpListener::bind(format!("0.0.0.0:{}", PORT))
         .await
         .expect("Failed to bind to address");
@@ -404,7 +411,7 @@ async fn handle_connection(mut stream: TcpStream) {
     .await;
 
     if connection_result.is_err() {
-        let _ = send_precompiled_response(&mut stream, &HEADER_TEMPLATES.request_timeout).await;
+        let _ = send_precompiled_response(&mut stream, &HEADER_TEMPLATES.get().unwrap().request_timeout).await;
     }
 }
 
@@ -428,7 +435,7 @@ async fn handle_connection_inner(stream: &mut TcpStream) -> Result<(), Box<dyn s
             Ok(Ok(0)) | Err(_) => break, // Connection closed or timeout
             Ok(Err(_)) => break,         // Read error
             Ok(Ok(size)) if size > MAX_REQUEST_SIZE => {
-                send_precompiled_response(stream, &HEADER_TEMPLATES.request_too_large).await?;
+                send_precompiled_response(stream, &HEADER_TEMPLATES.get().unwrap().request_too_large).await?;
                 break;
             }
             Ok(Ok(_)) => {}
@@ -443,13 +450,13 @@ async fn handle_connection_inner(stream: &mut TcpStream) -> Result<(), Box<dyn s
         let (method, path, version) = match parse_request_line_fast(request_bytes) {
             Some((m, p, v)) => (m, p, v),
             None => {
-                send_precompiled_response(stream, &HEADER_TEMPLATES.bad_request).await?;
+                send_precompiled_response(stream, &HEADER_TEMPLATES.get().unwrap().bad_request).await?;
                 break;
             }
         };
 
         if method != b"GET" && method != b"HEAD" {
-            send_precompiled_response(stream, &HEADER_TEMPLATES.method_not_allowed).await?;
+            send_precompiled_response(stream, &HEADER_TEMPLATES.get().unwrap().method_not_allowed).await?;
             break;
         }
 
@@ -520,11 +527,11 @@ async fn handle_request(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Handle health check endpoints with pre-compiled responses (optimized for performance)
     if path == "/health" {
-        return send_response(stream, &HEADER_TEMPLATES.health_response, is_head).await;
+        return send_response(stream, &HEADER_TEMPLATES.get().unwrap().health_response, is_head).await;
     }
 
     if path == "/ready" {
-        return send_response(stream, &HEADER_TEMPLATES.ready_response, is_head).await;
+        return send_response(stream, &HEADER_TEMPLATES.get().unwrap().ready_response, is_head).await;
     }
 
     serve_static_file(stream, path, is_head, if_modified_since, if_none_match).await
@@ -545,10 +552,10 @@ async fn serve_static_file(
     };
 
     // Try to get file metadata from cache
-    if let Some(file_metadata) = FILE_CACHE.get(&lookup_path) {
+    if let Some(file_metadata) = FILE_CACHE.get().unwrap().get(&lookup_path) {
         // Check file size limit (already validated during cache build, but double-check)
         if file_metadata.size > MAX_FILE_SIZE {
-            return send_precompiled_response(stream, &HEADER_TEMPLATES.file_too_large).await;
+            return send_precompiled_response(stream, &HEADER_TEMPLATES.get().unwrap().file_too_large).await;
         }
 
         // Handle conditional requests for 304 Not Modified
@@ -575,14 +582,14 @@ async fn serve_static_file(
                 }
                 Err(_) => {
                     // File disappeared since cache was built - should be rare
-                    return send_precompiled_response(stream, &HEADER_TEMPLATES.not_found).await;
+                    return send_precompiled_response(stream, &HEADER_TEMPLATES.get().unwrap().not_found).await;
                 }
             }
         }
         stream.flush().await?;
     } else {
         // File not in cache - return 404
-        return send_precompiled_response(stream, &HEADER_TEMPLATES.not_found).await;
+        return send_precompiled_response(stream, &HEADER_TEMPLATES.get().unwrap().not_found).await;
     }
 
     Ok(())
