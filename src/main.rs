@@ -414,13 +414,14 @@ async fn handle_connection(mut stream: TcpStream) {
 }
 
 async fn handle_connection_inner(stream: &mut TcpStream) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut reader = BufReader::new(stream);
+    
     loop {
         // Check for shutdown
         if SHUTDOWN.load(Ordering::Relaxed) {
             break;
         }
 
-        let mut reader = BufReader::new(&mut *stream);
         let mut request_line = String::new();
 
         // Read request line with timeout
@@ -433,7 +434,7 @@ async fn handle_connection_inner(stream: &mut TcpStream) -> Result<(), Box<dyn s
             Ok(Ok(0)) | Err(_) => break, // Connection closed or timeout
             Ok(Err(_)) => break,         // Read error
             Ok(Ok(size)) if size > MAX_REQUEST_SIZE => {
-                send_precompiled_response(stream, &HEADER_TEMPLATES.get().unwrap().request_too_large).await?;
+                send_precompiled_response(reader.get_mut(), &HEADER_TEMPLATES.get().unwrap().request_too_large).await?;
                 break;
             }
             Ok(Ok(_)) => {}
@@ -448,13 +449,13 @@ async fn handle_connection_inner(stream: &mut TcpStream) -> Result<(), Box<dyn s
         let (method, path, version) = match parse_request_line_fast(request_bytes) {
             Some((m, p, v)) => (m, p, v),
             None => {
-                send_precompiled_response(stream, &HEADER_TEMPLATES.get().unwrap().bad_request).await?;
+                send_precompiled_response(reader.get_mut(), &HEADER_TEMPLATES.get().unwrap().bad_request).await?;
                 break;
             }
         };
 
         if method != b"GET" && method != b"HEAD" {
-            send_precompiled_response(stream, &HEADER_TEMPLATES.get().unwrap().method_not_allowed).await?;
+            send_precompiled_response(reader.get_mut(), &HEADER_TEMPLATES.get().unwrap().method_not_allowed).await?;
             break;
         }
 
@@ -503,11 +504,14 @@ async fn handle_connection_inner(stream: &mut TcpStream) -> Result<(), Box<dyn s
 
         // Handle the request
         let is_head = method == b"HEAD";
-        match handle_request(stream, path, is_head, if_modified_since.as_deref(), if_none_match.as_deref()).await {
+        
+        // Use the underlying stream for response writing without destroying the BufReader
+        match handle_request(reader.get_mut(), path, is_head, if_modified_since.as_deref(), if_none_match.as_deref()).await {
             Ok(_) => {
                 if !keep_alive {
                     break;
                 }
+                // BufReader remains intact for the next request - no recreation needed!
             }
             Err(_) => break,
         }
