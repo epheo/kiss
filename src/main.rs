@@ -288,7 +288,12 @@ fn generate_file_metadata(file_path: &std::path::Path, relative_path: &str) -> R
     let size = file_metadata.len();
     let last_modified_raw = file_metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
     // Truncate to second precision during cache building for HTTP compliance
-    let last_modified = truncate_to_seconds(&last_modified_raw);
+    let last_modified = {
+        let duration_since_epoch = last_modified_raw.duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_else(|_| Duration::from_secs(0));
+        let seconds_only = Duration::from_secs(duration_since_epoch.as_secs());
+        SystemTime::UNIX_EPOCH + seconds_only
+    };
     
     // Generate weak ETag using size and modification time
     let mtime_secs = last_modified
@@ -302,7 +307,7 @@ fn generate_file_metadata(file_path: &std::path::Path, relative_path: &str) -> R
     let mime_type_str = mime_type_enum.as_str();
     
     // Format HTTP date once during cache building - RFC 7231 compliant
-    let last_modified_str = format_http_date(last_modified);
+    let last_modified_str = httpdate::fmt_http_date(last_modified);
     
     // Pre-generate complete HTTP headers - eliminates all runtime allocations
     let headers = format!(
@@ -330,10 +335,7 @@ fn generate_file_metadata(file_path: &std::path::Path, relative_path: &str) -> R
     })
 }
 
-fn format_http_date(time: SystemTime) -> String {
-    // RFC 7231 compliant HTTP-date formatting - done once during cache building
-    httpdate::fmt_http_date(time)
-}
+// format_http_date function removed - inlined for efficiency
 
 #[tokio::main]
 async fn main() {
@@ -635,13 +637,7 @@ fn strip_etag_wrapper(etag: &str) -> &str {
         .trim_matches('"')
 }
 
-// Helper to truncate SystemTime to second precision for HTTP date comparison
-fn truncate_to_seconds(time: &SystemTime) -> SystemTime {
-    let duration_since_epoch = time.duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_else(|_| std::time::Duration::from_secs(0));
-    let seconds_only = std::time::Duration::from_secs(duration_since_epoch.as_secs());
-    SystemTime::UNIX_EPOCH + seconds_only
-}
+// truncate_to_seconds function removed - inlined for efficiency
 
 // RFC-compliant HTTP date comparison for If-Modified-Since
 fn is_not_modified_since(modified_since_str: &str, last_modified: &SystemTime) -> bool {

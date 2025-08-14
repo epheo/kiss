@@ -224,6 +224,76 @@ mod performance_regression_tests {
     
     #[test]
     #[ignore] // Performance test - run manually
+    fn test_sustained_capacity_static_files() {
+        // Sustained capacity test: Measure maximum sustainable throughput
+        const TEST_DURATION_SECS: u64 = 30;
+        const CONCURRENCY: usize = 100; // High concurrency to saturate server
+        const REQUESTS_PER_THREAD: usize = 10; // Small batches for continuous flow
+        
+        println!("Starting sustained capacity test for static files: {} concurrent connections for {} seconds", 
+                CONCURRENCY, TEST_DURATION_SECS);
+        
+        let start_time = Instant::now();
+        let mut total_requests = 0;
+        let mut successful_requests = 0;
+        let mut response_times = Vec::new();
+        
+        // Flood test: Send requests continuously without rate limiting
+        while start_time.elapsed().as_secs() < TEST_DURATION_SECS {
+            // Send requests as fast as possible - no timing constraints
+            let handles = create_concurrent_requests(CONCURRENCY, REQUESTS_PER_THREAD, "/index.html");
+            
+            for handle in handles {
+                total_requests += REQUESTS_PER_THREAD;
+                match handle.join() {
+                    Ok(Ok((count, duration))) => {
+                        successful_requests += count;
+                        if count > 0 {
+                            // Average response time for this batch
+                            response_times.push(duration / count as u32);
+                        }
+                    }
+                    Ok(Err(_)) => {}
+                    Err(_) => {}
+                }
+            }
+            // No sleep - continuous request sending for maximum throughput
+        }
+        
+        let actual_duration = start_time.elapsed();
+        let actual_rps = successful_requests as f64 / actual_duration.as_secs_f64();
+        
+        println!("Sustained capacity test results (static files):");
+        println!("  Duration: {:?}", actual_duration);
+        println!("  Requests: {} successful / {} total", successful_requests, total_requests);
+        println!("  Sustained RPS: {:.0}", actual_rps);
+        
+        if !response_times.is_empty() {
+            response_times.sort();
+            let avg_response_time = response_times.iter().sum::<Duration>() / response_times.len() as u32;
+            let p95_idx = (response_times.len() as f64 * 0.95) as usize;
+            let p95_response_time = response_times[p95_idx.min(response_times.len() - 1)];
+            
+            println!("  Avg response time: {:?}", avg_response_time);
+            println!("  95th percentile: {:?}", p95_response_time);
+            
+            // Sustained performance should remain consistent (no memory leaks/degradation)
+            assert!(avg_response_time < Duration::from_millis(10), 
+                   "Average response time degraded under sustained load: {:?}", avg_response_time);
+            assert!(p95_response_time < Duration::from_millis(50), 
+                   "95th percentile response time too high under sustained load: {:?}", p95_response_time);
+        }
+        
+        // Should maintain high success rate under sustained load
+        let success_rate = successful_requests as f64 / total_requests as f64;
+        assert!(success_rate > 0.95, "Success rate too low under sustained load: {:.2}%", success_rate * 100.0);
+        
+        // Report sustained capacity - no target to validate against
+        println!("✅ Sustained capacity test completed (static files): {:.0} req/s", actual_rps);
+    }
+    
+    #[test]
+    #[ignore] // Performance test - run manually
     fn test_maximum_throughput() {
         // Maximum throughput test: Measure peak performance similar to Apache Bench
         const TEST_DURATION_SECS: u64 = 5; // Shorter test for maximum stress
@@ -301,6 +371,87 @@ mod performance_regression_tests {
                "Maximum throughput too low: {:.0} req/s (expected >80K)", max_rps);
         
         println!("✅ Maximum throughput test passed: {:.0} req/s", max_rps);
+    }
+    
+    #[test]
+    #[ignore] // Performance test - run manually
+    fn test_maximum_throughput_static_files() {
+        // Maximum throughput test: Measure peak performance similar to Apache Bench
+        const TEST_DURATION_SECS: u64 = 5; // Shorter test for maximum stress
+        const HIGH_CONCURRENCY: usize = 100;
+        const REQUESTS_PER_THREAD: usize = 100;
+        
+        println!("Starting maximum throughput test for static files: {} concurrent connections for {} seconds", 
+                HIGH_CONCURRENCY, TEST_DURATION_SECS);
+        
+        let start_time = Instant::now();
+        let mut total_successful = 0;
+        let mut total_requests = 0;
+        let mut all_response_times = Vec::new();
+        
+        // Run multiple rounds of high-concurrency requests
+        while start_time.elapsed().as_secs() < TEST_DURATION_SECS {
+            let round_start = Instant::now();
+            let handles = create_concurrent_requests(HIGH_CONCURRENCY, REQUESTS_PER_THREAD, "/index.html");
+            
+            let mut round_successful = 0;
+            let mut round_response_times = Vec::new();
+            
+            for handle in handles {
+                total_requests += REQUESTS_PER_THREAD;
+                match handle.join() {
+                    Ok(Ok((count, duration))) => {
+                        round_successful += count;
+                        if count > 0 {
+                            // Distribute the total duration across successful requests
+                            let avg_time_per_request = duration / count as u32;
+                            for _ in 0..count {
+                                round_response_times.push(avg_time_per_request);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            
+            total_successful += round_successful;
+            all_response_times.extend(round_response_times);
+            
+            let round_duration = round_start.elapsed();
+            let round_rps = round_successful as f64 / round_duration.as_secs_f64();
+            println!("  Round: {} requests in {:?} ({:.0} req/s)", 
+                    round_successful, round_duration, round_rps);
+        }
+        
+        let total_duration = start_time.elapsed();
+        let max_rps = total_successful as f64 / total_duration.as_secs_f64();
+        
+        println!("Maximum throughput test results (static files):");
+        println!("  Duration: {:?}", total_duration);
+        println!("  Requests: {} successful / {} total", total_successful, total_requests);
+        println!("  Maximum RPS: {:.0}", max_rps);
+        
+        if !all_response_times.is_empty() {
+            all_response_times.sort();
+            let min_time = all_response_times[0];
+            let max_time = all_response_times[all_response_times.len() - 1];
+            let avg_time = all_response_times.iter().sum::<Duration>() / all_response_times.len() as u32;
+            let p95_idx = (all_response_times.len() as f64 * 0.95) as usize;
+            let p95_time = all_response_times[p95_idx.min(all_response_times.len() - 1)];
+            
+            println!("  Response times - Min: {:?}, Avg: {:?}, 95th: {:?}, Max: {:?}", 
+                    min_time, avg_time, p95_time, max_time);
+        }
+        
+        // Performance assertions for maximum throughput
+        let success_rate = total_successful as f64 / total_requests as f64;
+        assert!(success_rate > 0.90, "Success rate too low under max load: {:.2}%", success_rate * 100.0);
+        
+        // Should achieve significant throughput (compare to Apache Bench results)
+        assert!(max_rps > 80000.0, 
+               "Maximum throughput too low: {:.0} req/s (expected >80K)", max_rps);
+        
+        println!("✅ Maximum throughput test passed (static files): {:.0} req/s", max_rps);
     }
     
     

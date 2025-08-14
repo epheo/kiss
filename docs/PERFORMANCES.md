@@ -228,9 +228,13 @@ cargo run --release
 # Run performance benchmarks in another terminal
 cargo test bench_ -- --include-ignored --nocapture
 
-# Run specific throughput tests
+# Run specific throughput tests (/health point)
 cargo test test_maximum_throughput -- --include-ignored --nocapture
 cargo test test_sustained_capacity -- --include-ignored --nocapture
+
+# Run specific throughput tests (/index.html)
+cargo test test_maximum_throughput_static_files -- --include-ignored --nocapture
+cargo test test_sustained_capacity_static_files -- --include-ignored --nocapture
 ```
 
 ### Performance Test Categories
