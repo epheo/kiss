@@ -1,13 +1,18 @@
 # KISS Instant Static Server
 
--- KeepItSimpleStupid Instant Static Server
+KISS (Kubernetes Instant Static Server) is an in-memory static file server written in Rust, designed as a minimalistic base image for Kubernetes deployments.
 
-This is a minimalistic **base image** for serving static files behind a Kubernetes ingress controller.
+## Overview
 
-KISS is a Rust based highly specific web server serving a single purpose: "To serve static files built in a container image in a Kubernetes environment, fast".
-See following chapter and "Performance Architecture" ragarding its trade-offs.
+KISS implements an in-memory architecture that pre-loads static files at startup, eliminating disk I/O during request processing. This approach is designed for static websites, single-page applications, and documentation in containerized environments.
 
-KISS provides a secure, lightweight foundation that users extend with their own static content. The server serves files from the container root directory (`/`) while protecting the server binary at `/kiss`.
+**Characteristics:**
+- In-memory file serving with zero disk I/O during requests
+- Single-purpose design focused on static content delivery
+- Container-optimized for Kubernetes deployments
+- Minimal dependencies and attack surface
+
+KISS serves files from the container root directory (`/`) while protecting the server binary at `/kiss`.
 
 
 ## What KISS does NOT implement (by design)
@@ -274,40 +279,58 @@ KISS is designed with security as a primary concern:
 
 ## Performance Architecture
 
-KISS uses a **startup file cache** system that pre-computes all file metadata and HTTP headers at server initialization, enabling zero-allocation request handling.
+KISS implements an in-memory architecture that pre-loads all static files and pre-generates complete HTTP responses at startup, eliminating disk I/O during request processing.
 
-### How It Works
+### Architecture Overview
 
-At startup, KISS recursively scans the static directory and builds an in-memory HashMap containing:
-- **Complete HTTP headers**: Pre-generated response headers including MIME types, content lengths, ETags, and security headers
-- **File paths**: Pre-computed absolute paths to eliminate runtime string building
-- **Metadata**: File sizes, modification times, and ETags for conditional request handling
+At startup, KISS scans the static directory and builds an in-memory cache containing:
+- **Complete HTTP responses**: Pre-generated headers and content combined for single-write operations
+- **File content**: All files loaded entirely into memory
+- **Conditional responses**: Pre-computed 304 Not Modified responses
+- **Path variations**: Common URL patterns pre-computed to eliminate string operations
 
-### Performance Benefits
+### Performance Characteristics
 
-This approach delivers exceptional performance through:
-- **Zero Runtime Allocations**: Headers are pre-built, not generated per request
-- **O(1) File Lookups**: HashMap access instead of filesystem operations
-- **Eliminated String Building**: All paths and headers pre-computed at startup
-- **Memory Locality**: All file metadata loaded upfront for better cache performance
+**Performance Characteristics:**
+- Small files (< 1KB): 198,000 requests/second
+- Medium files (100KB): 61,000 requests/second  
+- Response times: 0.5-1.6ms for files under 1MB
+- Zero disk I/O during request serving
 
-### Security Advantages
+**Implementation Details:**
+- Single write() system call per request
+- Pre-computed HTTP responses stored in memory
+- HashMap-based file lookups
+- Rust's zero-cost abstractions for performance
 
-The startup cache provides additional security:
-- **Immutable File Set**: Only files present at startup can be served
-- **Directory Traversal Protection**: Cache lookups prevent access to files outside the initial scan
-- **Attack Surface Reduction**: No dynamic file system access during request handling
+### Security Considerations
 
-### Container Optimization
+The in-memory architecture provides certain security characteristics:
+- Only files present at startup can be served
+- Cache-based lookups help prevent directory traversal attempts
+- No dynamic file system access during request handling
+- Reduced attack surface through single-purpose design
 
-This design is optimized for the container use case:
-- **Immutable Infrastructure**: Perfect for containers where static files don't change after deployment
-- **Fast Container Startup**: File scanning happens once during initialization
-- **Predictable Memory Usage**: Memory footprint determined by static file count at build time
+### Container Design
 
-### Trade-offs
+This architecture aligns with container deployment patterns:
+- Suitable for immutable infrastructure where content doesn't change post-deployment
+- Memory footprint determined at build time based on static file set
+- Single initialization phase during container startup
 
-- **Memory Usage**: Scales with number of static files (minimal impact for typical websites)
-- **Dynamic Files**: New files added after startup require a container restart to be served
-- **Startup Time**: Initial file scanning adds minimal overhead during container start
+### Architectural Trade-offs
+
+**Benefits:**
+- High performance for static content serving
+- Consistent latency without disk I/O variance  
+- Well-suited for container environments with static content
+- Reduced system call overhead
+
+**Limitations:**
+- Memory usage scales with total content size
+- Performance optimized for files under 1MB
+- Content is immutable during runtime (requires container restart for changes)
+- Startup time correlates with file count and total size
+
+For detailed performance analysis, see `docs/PERFORMANCES.md`.
 

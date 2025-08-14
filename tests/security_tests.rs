@@ -38,8 +38,8 @@ mod security_integration_tests {
     #[test]
     #[ignore] // Requires server to be running
     fn test_file_size_limits() {
-        // This test would verify that files larger than MAX_FILE_SIZE are rejected
-        // In a real scenario, we'd set up a test file larger than 50MB in the static directory
+        // This test would verify that large files are handled properly during cache building
+        // In a real scenario, we'd set up a test file larger than optimal size in the static directory
         match send_get_request("/large-file.bin") {
             Ok(response) => {
                 // Should return 413 if file exists and is too large, or 404 if not found

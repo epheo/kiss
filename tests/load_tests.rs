@@ -90,7 +90,7 @@ mod worker_pool_tests {
     #[test]
     #[ignore] // Requires server to be running
     fn test_worker_pool_saturation() {
-        const NUM_CONCURRENT: usize = 50; // More than MAX_WORKER_THREADS (30)
+        const NUM_CONCURRENT: usize = 50; // Test high concurrency behavior
         
         let start_time = Instant::now();
         let handles = create_concurrent_connections(NUM_CONCURRENT, "/health");

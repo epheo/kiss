@@ -76,7 +76,7 @@ impl HeaderTemplates {
             body.len()
         ).into_bytes();
         
-        // PHASE 4B: Create unified single-write responses
+        // Create unified single-write responses
         let mut complete_response = Vec::with_capacity(headers.len() + body.len());
         complete_response.extend_from_slice(&headers);
         complete_response.extend_from_slice(body);
@@ -91,7 +91,7 @@ impl HeaderTemplates {
             body.len()
         ).into_bytes();
         
-        // PHASE 4B: Create unified single-write responses
+        // Create unified single-write responses
         let mut complete_response = Vec::with_capacity(headers.len() + body.len());
         complete_response.extend_from_slice(&headers);
         complete_response.extend_from_slice(body);
@@ -293,7 +293,7 @@ fn discover_files_recursive(
                 url_path.push('/');
                 url_path.push_str(&current_relative);
                 
-                // PHASE 4C OPTIMIZATION: Pre-compute ALL path variations to eliminate runtime string ops
+                // Pre-compute ALL path variations to eliminate runtime string ops
                 cache.insert(url_path.clone(), file_metadata.clone());
                 
                 // Special handling for index.html - also serve it as root "/"
@@ -384,7 +384,6 @@ fn generate_file_metadata(file_path: &std::path::Path, _relative_path: &str) -> 
     })
 }
 
-// format_http_date function removed - inlined for efficiency
 
 #[tokio::main]
 async fn main() {
@@ -552,7 +551,7 @@ async fn handle_connection_inner(stream: &mut TcpStream) -> Result<(), Box<dyn s
             }
         }
 
-        // PHASE 3 OPTIMIZATION: Fast method detection and request handling
+        // Fast method detection and request handling
         let is_head = method == b"HEAD";
         
         // Direct stream usage for optimal response performance
@@ -589,7 +588,7 @@ async fn handle_request(
     // Handle health check endpoints using unified response pattern
     let templates = HEADER_TEMPLATES.get().unwrap();
     
-    // PHASE 4B: Unified single-write pattern for health endpoints
+    // Unified single-write pattern for health endpoints
     if path == "/health" {
         if is_head {
             stream.write_all(&templates.health_headers_only).await?;
@@ -610,7 +609,7 @@ async fn handle_request(
         return Ok(());
     }
 
-    // PHASE 4D OPTIMIZATION: Inline static file serving for zero function call overhead
+    // Inline static file serving for zero function call overhead
     
     // Ultra-fast path lookup with pre-computed variations
     let file_cache = FILE_CACHE.get().unwrap();
@@ -664,12 +663,4 @@ async fn handle_request(
 
     Ok(())
 }
-
-// serve_static_file function removed - inlined into handle_request for zero overhead
-
-// Legacy conditional request functions removed - replaced with ultra-fast ETag check
-
-
-
-
 

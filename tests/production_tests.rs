@@ -80,7 +80,7 @@ mod graceful_shutdown_tests {
         let shutdown_start = Instant::now();
         let mut shutdown_completed = false;
         
-        // Wait for server to shut down (max 15 seconds - longer than SHUTDOWN_TIMEOUT_SECS)
+        // Wait for server to shut down (max 15 seconds)
         while shutdown_start.elapsed() < Duration::from_secs(15) {
             match server.try_wait() {
                 Ok(Some(_exit_status)) => {
@@ -105,7 +105,7 @@ mod graceful_shutdown_tests {
         let shutdown_time = shutdown_start.elapsed();
         println!("Graceful shutdown took: {:?}", shutdown_time);
         
-        // Should shut down within reasonable time (SHUTDOWN_TIMEOUT_SECS + buffer)
+        // Should shut down within reasonable time
         assert!(shutdown_time < Duration::from_secs(12), 
                "Shutdown took too long: {:?}", shutdown_time);
     }
@@ -215,7 +215,7 @@ mod graceful_shutdown_tests {
             let _ = server.kill();
         }
         
-        // Should eventually shut down (may take up to SHUTDOWN_TIMEOUT_SECS)
+        // Should eventually shut down
         assert!(shutdown_completed, "Server should eventually shut down even with active connections");
     }
 }

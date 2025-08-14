@@ -640,7 +640,7 @@ mod file_serving_tests {
         let temp_dir = TempDir::new().unwrap();
         let large_file = temp_dir.path().join("large.txt");
         
-        // Create a file larger than MAX_FILE_SIZE (50MB)
+        // Create a large file for testing cache building behavior
         let large_content = "x".repeat(52 * 1024 * 1024); // 52MB
         fs::write(&large_file, &large_content).unwrap();
         
