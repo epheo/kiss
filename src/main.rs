@@ -81,41 +81,119 @@ impl HeaderTemplates {
     }
 }
 
-// Fast case-insensitive ASCII comparison without allocation
-fn header_starts_with(header_line: &str, prefix: &str) -> bool {
+// Optimized case-insensitive ASCII comparison using SIMD-friendly approach
+fn header_starts_with(header_line: &[u8], prefix: &[u8]) -> bool {
     if header_line.len() < prefix.len() {
         return false;
     }
     
-    header_line[..prefix.len()].eq_ignore_ascii_case(prefix)
+    // Direct byte comparison is faster for short prefixes
+    for i in 0..prefix.len() {
+        let h = header_line[i];
+        let p = prefix[i];
+        if h != p && h.to_ascii_lowercase() != p.to_ascii_lowercase() {
+            return false;
+        }
+    }
+    true
 }
 
-// Fast case-insensitive contains check without allocation
-fn header_contains(header_line: &str, substring: &str) -> bool {
-    // Use a simple ASCII case-insensitive search
-    let header_bytes = header_line.as_bytes();
-    let sub_bytes = substring.as_bytes();
-    
-    if sub_bytes.is_empty() {
+// Optimized case-insensitive contains check using Boyer-Moore-like approach
+fn header_contains(header_line: &[u8], substring: &[u8]) -> bool {
+    if substring.is_empty() {
         return true;
     }
     
-    if header_bytes.len() < sub_bytes.len() {
+    if header_line.len() < substring.len() {
         return false;
     }
     
-    'outer: for i in 0..=(header_bytes.len() - sub_bytes.len()) {
-        for j in 0..sub_bytes.len() {
-            let h = header_bytes[i + j];
-            let s = sub_bytes[j];
-            // ASCII case-insensitive comparison
+    let first_char = substring[0].to_ascii_lowercase();
+    let mut i = 0;
+    
+    while i <= header_line.len() - substring.len() {
+        // Quick first-byte check
+        if header_line[i].to_ascii_lowercase() != first_char {
+            i += 1;
+            continue;
+        }
+        
+        // Check remaining bytes
+        let mut matches = true;
+        for j in 1..substring.len() {
+            let h = header_line[i + j];
+            let s = substring[j];
             if h != s && h.to_ascii_lowercase() != s.to_ascii_lowercase() {
-                continue 'outer;
+                matches = false;
+                break;
             }
         }
-        return true;
+        
+        if matches {
+            return true;
+        }
+        i += 1;
     }
     false
+}
+
+// Helper function to read a line into a byte buffer
+async fn read_line_bytes(reader: &mut BufReader<&mut TcpStream>, buffer: &mut Vec<u8>) -> Result<usize, std::io::Error> {
+    let mut total_bytes = 0;
+    loop {
+        let bytes_read = reader.read_until(b'\n', buffer).await?;
+        total_bytes += bytes_read;
+        if bytes_read == 0 || buffer.ends_with(b"\n") {
+            break;
+        }
+    }
+    Ok(total_bytes)
+}
+
+// Fast header line trimming
+fn trim_header_line(line: &[u8]) -> &[u8] {
+    let mut start = 0;
+    let mut end = line.len();
+    
+    // Trim trailing CRLF and whitespace
+    while end > 0 {
+        match line[end - 1] {
+            b'\r' | b'\n' | b' ' | b'\t' => end -= 1,
+            _ => break,
+        }
+    }
+    
+    // Trim leading whitespace
+    while start < end {
+        match line[start] {
+            b' ' | b'\t' => start += 1,
+            _ => break,
+        }
+    }
+    
+    &line[start..end]
+}
+
+// Extract header value without allocation
+fn extract_header_value<'a>(line: &'a [u8], header_name: &[u8]) -> Option<&'a [u8]> {
+    if line.len() <= header_name.len() {
+        return None;
+    }
+    
+    let value_start = header_name.len();
+    let value_bytes = &line[value_start..];
+    
+    // Skip whitespace after colon
+    let mut start = 0;
+    while start < value_bytes.len() && (value_bytes[start] == b' ' || value_bytes[start] == b'\t') {
+        start += 1;
+    }
+    
+    if start >= value_bytes.len() {
+        return None;
+    }
+    
+    Some(&value_bytes[start..])
 }
 
 // Fast zero-allocation HTTP request line parser
@@ -358,29 +436,36 @@ async fn handle_connection_inner(stream: &mut TcpStream) -> Result<(), Box<dyn s
         let mut if_modified_since: Option<String> = None;
         let mut if_none_match: Option<String> = None;
         
-        // Optimized header parsing - zero allocation case-insensitive comparison
-        let mut header_buffer = String::new();
+        // Ultra-optimized header parsing with minimal allocations
+        let mut header_buffer = Vec::with_capacity(256); // Pre-allocate reasonable buffer
         loop {
             header_buffer.clear();
-            match reader.read_line(&mut header_buffer).await {
-                Ok(0) => break,
+            
+            // Read header line into byte buffer
+            match read_line_bytes(&mut reader, &mut header_buffer).await {
+                Ok(0) => break, // Connection closed
                 Ok(_) => {
-                    let line = header_buffer.trim();
-                    if line.is_empty() {
+                    if header_buffer.is_empty() || (header_buffer.len() == 2 && header_buffer == b"\r\n") {
                         break; // End of headers
                     }
                     
-                    // Zero-allocation case-insensitive header parsing
-                    if header_starts_with(line, "connection:") {
-                        let connection_close_requested = header_contains(line, "close");
-                        keep_alive = !connection_close_requested && (version == "HTTP/1.1" || header_contains(line, "keep-alive"));
-                    } else if header_starts_with(line, "if-modified-since:") {
-                        if let Some(value) = line.splitn(2, ':').nth(1) {
-                            if_modified_since = Some(value.trim().to_string());
+                    // Trim CRLF and whitespace
+                    let line = trim_header_line(&header_buffer);
+                    if line.is_empty() {
+                        break;
+                    }
+                    
+                    // Optimized header parsing using byte slices
+                    if header_starts_with(line, b"connection:") {
+                        let connection_close_requested = header_contains(line, b"close");
+                        keep_alive = !connection_close_requested && (version == "HTTP/1.1" || header_contains(line, b"keep-alive"));
+                    } else if header_starts_with(line, b"if-modified-since:") {
+                        if let Some(value) = extract_header_value(line, b"if-modified-since:") {
+                            if_modified_since = Some(String::from_utf8_lossy(value).into_owned());
                         }
-                    } else if header_starts_with(line, "if-none-match:") {
-                        if let Some(value) = line.splitn(2, ':').nth(1) {
-                            if_none_match = Some(value.trim().to_string());
+                    } else if header_starts_with(line, b"if-none-match:") {
+                        if let Some(value) = extract_header_value(line, b"if-none-match:") {
+                            if_none_match = Some(String::from_utf8_lossy(value).into_owned());
                         }
                     }
                 }
@@ -460,14 +545,18 @@ async fn serve_static_file(
 
         // For HEAD requests, only send headers, not the file content
         if !is_head {
-            // Open and stream the file content (zero-copy)
-            let actual_file_path = if lookup_path == "/index.html" {
-                format!("{}/index.html", STATIC_DIR)
+            // Open and stream the file content (zero-copy) - optimized path construction
+            let file_result = if lookup_path == "/index.html" {
+                File::open("./index.html").await
             } else {
-                format!("{}{}", STATIC_DIR, lookup_path)
+                // Use more efficient path construction
+                let mut path_buf = String::with_capacity(STATIC_DIR.len() + lookup_path.len());
+                path_buf.push_str(STATIC_DIR);
+                path_buf.push_str(&lookup_path);
+                File::open(path_buf).await
             };
             
-            if let Ok(mut file) = File::open(&actual_file_path).await {
+            if let Ok(mut file) = file_result {
                 tokio::io::copy(&mut file, stream).await?;
             } else {
                 // File disappeared since cache was built - should be rare
@@ -491,23 +580,18 @@ fn should_return_not_modified(
 ) -> Option<bool> {
     // If-None-Match takes precedence over If-Modified-Since
     if let Some(none_match_value) = if_none_match {
-        // Handle ETag comparison
-        // Support both weak and strong ETags, and "*" wildcard
+        // Handle ETag comparison - support both weak and strong ETags, and "*" wildcard
         if none_match_value == "*" {
             return Some(true);
         }
         
-        // Parse comma-separated ETags
-        let client_etags: Vec<&str> = none_match_value
-            .split(',')
-            .map(|s| s.trim())
-            .collect();
+        // Optimized ETag comparison without Vec allocation
+        let our_etag = strip_etag_wrapper(etag);
         
-        // Check if our ETag matches any of the client's ETags
-        let our_etag = etag.trim_start_matches("W/").trim_matches('"');
-        for client_etag in client_etags {
-            let clean_client_etag = client_etag.trim_start_matches("W/").trim_matches('"');
-            if clean_client_etag == our_etag {
+        // Parse comma-separated ETags using iterator (no allocation)
+        for client_etag_raw in none_match_value.split(',') {
+            let client_etag = strip_etag_wrapper(client_etag_raw.trim());
+            if client_etag == our_etag {
                 return Some(true);
             }
         }
@@ -515,27 +599,37 @@ fn should_return_not_modified(
         return Some(false);
     }
     
-    // Handle If-Modified-Since
+    // Handle If-Modified-Since - optimized timestamp comparison
     if let Some(modified_since_str) = if_modified_since {
-        // For simplicity, we'll do a basic string comparison since our format is timestamp_X
-        // In production, you'd parse the HTTP date properly
-        let our_timestamp = last_modified
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap_or(Duration::from_secs(0))
-            .as_secs();
-        
-        // Extract timestamp from our simple format
-        if let Some(timestamp_str) = modified_since_str.strip_prefix("timestamp_") {
-            if let Ok(client_timestamp) = timestamp_str.parse::<u64>() {
-                // If file hasn't been modified since client's timestamp, return 304
-                return Some(our_timestamp <= client_timestamp);
-            }
-        }
-        
-        return Some(false);
+        return Some(is_not_modified_since(modified_since_str, last_modified));
     }
     
     None // No conditional headers present
+}
+
+// Fast ETag wrapper stripping without allocation
+fn strip_etag_wrapper(etag: &str) -> &str {
+    etag.trim()
+        .strip_prefix("W/").unwrap_or(etag.trim())
+        .trim_matches('"')
+}
+
+// Optimized timestamp comparison for If-Modified-Since
+fn is_not_modified_since(modified_since_str: &str, last_modified: &SystemTime) -> bool {
+    // Fast path for our simple timestamp format
+    if let Some(timestamp_str) = modified_since_str.strip_prefix("timestamp_") {
+        if let Ok(client_timestamp) = timestamp_str.parse::<u64>() {
+            let our_timestamp = last_modified
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or(Duration::from_secs(0))
+                .as_secs();
+            return our_timestamp <= client_timestamp;
+        }
+    }
+    
+    // For proper HTTP date parsing, we'd need a more complex implementation
+    // For now, be conservative and assume file was modified
+    false
 }
 
 async fn send_not_modified_response(
