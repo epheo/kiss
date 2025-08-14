@@ -1,8 +1,7 @@
 use std::collections::HashMap;
-use std::fs::{read_dir, metadata};
+use std::fs::{read_dir, metadata, read};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::SystemTime;
-use tokio::fs::File;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::signal;
@@ -19,12 +18,12 @@ const KEEPALIVE_TIMEOUT_SECS: u64 = 5;
 
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
-// Optimized file metadata - pre-computed headers and paths for zero request overhead
+// Zero-I/O file metadata - everything preloaded in memory
 #[derive(Clone, Debug)]
 struct FileMetadata {
-    headers: Vec<u8>,                // Pre-generated complete HTTP headers (biggest win)
-    file_path: String,               // Pre-computed file path (eliminates string building)
-    // size removed - no longer used for runtime validation
+    complete_response: Vec<u8>,      // Headers + content combined for single write
+    headers_only: Vec<u8>,           // Headers only for HEAD requests
+    not_modified_response: Vec<u8>,  // Pre-generated 304 response
     last_modified: SystemTime,       // Keep for conditional request logic
     etag: String,                    // Keep for conditional logic
 }
@@ -42,7 +41,6 @@ struct HeaderTemplates {
     request_too_large: Vec<u8>,
     bad_request: Vec<u8>,
     request_timeout: Vec<u8>,
-    not_modified: Vec<u8>,
     
     // Health endpoint responses (split for optimized handling)
     health_headers: Vec<u8>,
@@ -62,7 +60,6 @@ impl HeaderTemplates {
             request_too_large: b"HTTP/1.1 413 Request Entity Too Large\r\nContent-Type: text/plain\r\nContent-Length: 17\r\nX-Content-Type-Options: nosniff\r\nConnection: keep-alive\r\n\r\nRequest too large".to_vec(),
             bad_request: b"HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\nContent-Length: 17\r\nX-Content-Type-Options: nosniff\r\nConnection: keep-alive\r\n\r\nMalformed request".to_vec(),
             request_timeout: b"HTTP/1.1 408 Request Timeout\r\nContent-Type: text/plain\r\nContent-Length: 15\r\nX-Content-Type-Options: nosniff\r\nConnection: keep-alive\r\n\r\nRequest timeout".to_vec(),
-            not_modified: b"HTTP/1.1 304 Not Modified\r\nCache-Control: public, max-age=3600\r\nConnection: keep-alive\r\n\r\n".to_vec(),
             
             health_headers,
             health_body,
@@ -283,7 +280,23 @@ fn discover_files_recursive(
                 let mut url_path = String::with_capacity(current_relative.len() + 1);
                 url_path.push('/');
                 url_path.push_str(&current_relative);
-                cache.insert(url_path, file_metadata);
+                
+                // PHASE 3 OPTIMIZATION: Pre-compute common path variations
+                cache.insert(url_path.clone(), file_metadata.clone());
+                
+                // Special handling for index.html - also serve it as root "/"
+                if current_relative == "index.html" {
+                    cache.insert("/".to_string(), file_metadata.clone());
+                }
+                
+                // Pre-compute paths with query parameters stripped (common case)
+                if !url_path.contains('?') {
+                    // Already clean, but ensure we have both with and without trailing variations
+                    if url_path.len() > 1 && !url_path.ends_with('/') {
+                        let with_slash = format!("{}/", url_path);
+                        cache.insert(with_slash, file_metadata.clone());
+                    }
+                }
             }
         } else if metadata.is_dir() {
             // Recursively process directories
@@ -294,7 +307,7 @@ fn discover_files_recursive(
     Ok(())
 }
 
-fn generate_file_metadata(file_path: &std::path::Path, relative_path: &str) -> Result<FileMetadata, Box<dyn std::error::Error>> {
+fn generate_file_metadata(file_path: &std::path::Path, _relative_path: &str) -> Result<FileMetadata, Box<dyn std::error::Error>> {
     let file_metadata = metadata(file_path)?;
     let size = file_metadata.len();
     let last_modified_raw = file_metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
@@ -320,28 +333,37 @@ fn generate_file_metadata(file_path: &std::path::Path, relative_path: &str) -> R
     // Format HTTP date once during cache building - RFC 7231 compliant
     let last_modified_str = httpdate::fmt_http_date(last_modified);
     
-    // Pre-generate minimal HTTP headers for static cache server
-    // Only essential headers: caching, content type, and basic security
+    // ZERO-I/O OPTIMIZATION: Pre-load file content into memory
+    let content = read(file_path)?;
+    let actual_size = content.len();
+    
+    // Pre-generate complete HTTP headers
     let headers = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\nLast-Modified: {}\r\nETag: {}\r\nCache-Control: public, max-age=3600\r\nX-Content-Type-Options: nosniff\r\nConnection: keep-alive\r\n\r\n",
-        mime_type_str, size, last_modified_str, etag
+        mime_type_str, actual_size, last_modified_str, etag
     ).into_bytes();
     
-    // Pre-compute file path - eliminates runtime string building
-    let full_file_path = if relative_path == "index.html" {
-        "./index.html".to_string()
-    } else {
-        let mut path_buf = String::with_capacity(STATIC_DIR.len() + relative_path.len() + 1);
-        path_buf.push_str(STATIC_DIR);
-        path_buf.push('/');
-        path_buf.push_str(relative_path);
-        path_buf
-    };
+    // Pre-generate headers-only response for HEAD requests
+    let headers_only = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\nLast-Modified: {}\r\nETag: {}\r\nCache-Control: public, max-age=3600\r\nX-Content-Type-Options: nosniff\r\nConnection: keep-alive\r\n\r\n",
+        mime_type_str, actual_size, last_modified_str, etag
+    ).into_bytes();
+    
+    // ULTIMATE OPTIMIZATION: Pre-combine headers + content for single write()
+    let mut complete_response = Vec::with_capacity(headers.len() + content.len());
+    complete_response.extend_from_slice(&headers);
+    complete_response.extend_from_slice(&content);
+    
+    // Pre-generate custom 304 Not Modified response with file-specific ETag
+    let not_modified_response = format!(
+        "HTTP/1.1 304 Not Modified\r\nETag: {}\r\nCache-Control: public, max-age=3600\r\nConnection: keep-alive\r\n\r\n",
+        etag
+    ).into_bytes();
     
     Ok(FileMetadata {
-        headers,
-        file_path: full_file_path,
-        // size removed - no longer needed for runtime
+        complete_response,
+        headers_only,
+        not_modified_response,
         last_modified,
         etag,
     })
@@ -515,7 +537,7 @@ async fn handle_connection_inner(stream: &mut TcpStream) -> Result<(), Box<dyn s
             }
         }
 
-        // Handle the request
+        // PHASE 3 OPTIMIZATION: Fast method detection and request handling
         let is_head = method == b"HEAD";
         
         // Direct stream usage for optimal response performance
@@ -580,23 +602,20 @@ async fn serve_static_file(
     if_modified_since: Option<&str>,
     if_none_match: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // PHASE 3 OPTIMIZATION: Ultra-fast path lookup with minimal allocations
+    let file_cache = FILE_CACHE.get().unwrap();
+    
     // Strip query parameters for cache lookup (zero allocation)
     let clean_path = path.split('?').next().unwrap_or(path);
     
-    // Smart lookup: try direct path first, then index.html for root
-    let file_cache = FILE_CACHE.get().unwrap();
-    let file_metadata = file_cache.get(clean_path)
-        .or_else(|| if clean_path == "/" { 
-            file_cache.get("/index.html") 
-        } else { 
-            None 
-        });
+    // Direct cache lookup - no fallback logic needed since we pre-computed variations
+    let file_metadata = file_cache.get(clean_path);
 
     // Try to get file metadata from cache
     if let Some(file_metadata) = file_metadata {
         // Files in cache are already validated during startup - no need to re-check size
 
-        // Handle conditional requests for 304 Not Modified
+        // PHASE 2 OPTIMIZATION: Fast conditional request handling with pre-generated 304
         if let Some(should_return_304) = should_return_not_modified(
             if_modified_since,
             if_none_match,
@@ -604,30 +623,22 @@ async fn serve_static_file(
             &file_metadata.etag,
         ) {
             if should_return_304 {
-                stream.write_all(&HEADER_TEMPLATES.get().unwrap().not_modified).await?;
+                // Use pre-generated file-specific 304 response (includes correct ETag)
+                stream.write_all(&file_metadata.not_modified_response).await?;
                 stream.flush().await?;
                 return Ok(());
             }
         }
 
-        // Send pre-generated headers - zero allocations!
-        stream.write_all(&file_metadata.headers).await?;
-
-        // For HEAD requests, only send headers, not the file content
-        if !is_head {
-            // Use pre-computed file path - zero string building!
-            match File::open(&file_metadata.file_path).await {
-                Ok(mut file) => {
-                    tokio::io::copy(&mut file, stream).await?;
-                }
-                Err(_) => {
-                    // File disappeared since cache was built - should be rare
-                    stream.write_all(&HEADER_TEMPLATES.get().unwrap().not_found).await?;
-                    stream.flush().await?;
-                    return Ok(());
-                }
-            }
+        // ULTRA OPTIMIZATION: Single write operation, minimal system calls
+        if is_head {
+            // HEAD request: Send headers only (pre-generated, single write)
+            stream.write_all(&file_metadata.headers_only).await?;
+        } else {
+            // GET request: Send complete response (headers + content in single write!)
+            stream.write_all(&file_metadata.complete_response).await?;
         }
+        // Single flush per request (not per write operation)
         stream.flush().await?;
     } else {
         // File not in cache - return 404
