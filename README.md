@@ -1,6 +1,6 @@
-# Kubernetes Instant Static Server
+# KISS Instant Static Server
 
--- Keep It Simple Stupid
+-- KeepItSimpleStupid Instant Static Server
 
 This is a minimalistic **base image** for serving static files behind a Kubernetes ingress controller.
 

@@ -15,7 +15,6 @@ mod http_request_validation_tests {
             "DELETE /index.html HTTP/1.1\r\nHost: localhost\r\n\r\n",
             "PATCH /index.html HTTP/1.1\r\nHost: localhost\r\n\r\n",
             "OPTIONS /index.html HTTP/1.1\r\nHost: localhost\r\n\r\n",
-            "HEAD /index.html HTTP/1.1\r\nHost: localhost\r\n\r\n",
         ];
         
         for request in &invalid_methods {
@@ -28,6 +27,35 @@ mod http_request_validation_tests {
                     println!("Warning: Server not running, skipping method test");
                     break;
                 }
+            }
+        }
+    }
+    
+    #[test]
+    #[ignore] // Requires server to be running
+    fn test_head_method_support() {
+        // HEAD requests should be supported and return headers without body
+        let head_request = "HEAD /health HTTP/1.1\r\nHost: localhost\r\n\r\n";
+        
+        match send_raw_request(head_request) {
+            Ok(response) => {
+                assert!(response.contains("HTTP/1.1 200 OK"), 
+                       "HEAD request should return 200 OK");
+                assert!(response.contains("Content-Type: application/json"), 
+                       "HEAD response should contain Content-Type header");
+                assert!(response.contains("Content-Length:"), 
+                       "HEAD response should contain Content-Length header");
+                
+                // HEAD response should not contain body (check that response ends after headers)
+                let body_start = response.find("\r\n\r\n").unwrap() + 4;
+                let body = &response[body_start..];
+                assert!(body.is_empty() || body.trim().is_empty(), 
+                       "HEAD response should not contain body content");
+                
+                println!("✓ HEAD method properly supported");
+            }
+            Err(_) => {
+                println!("Warning: Server not running, skipping HEAD method test");
             }
         }
     }

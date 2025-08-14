@@ -88,15 +88,36 @@ mod http_integration_tests {
     
     #[test]
     #[ignore] // Requires server to be running
-    fn test_security_headers() {
+    fn test_security_headers_on_cached_files() {
+        // Test that security headers are present on cached file responses
+        match send_get_request("/index.html") {
+            Ok(response) => {
+                assert!(response.contains("X-Frame-Options: DENY"));
+                assert!(response.contains("X-Content-Type-Options: nosniff"));
+                assert!(response.contains("Content-Security-Policy:"));
+                
+                // Also verify caching headers are present alongside security headers
+                assert!(response.contains("ETag: W/"));
+                assert!(response.contains("Last-Modified:"));
+                
+                println!("✓ Security headers present on cached file responses");
+            }
+            Err(_) => {
+                println!("Warning: Server not running, skipping cached security header test");
+            }
+        }
+        
+        // Also test health endpoint (non-cached)
         match send_get_request("/health") {
             Ok(response) => {
                 assert!(response.contains("X-Frame-Options: DENY"));
                 assert!(response.contains("X-Content-Type-Options: nosniff"));
                 assert!(response.contains("Content-Security-Policy:"));
+                
+                println!("✓ Security headers present on health endpoint");
             }
             Err(_) => {
-                println!("Warning: Server not running, skipping integration test");
+                println!("Warning: Server not running, skipping health security header test");
             }
         }
     }
@@ -140,8 +161,8 @@ mod http_integration_tests {
 
     #[test]
     #[ignore] // Requires server to be running from tests/content/
-    fn test_multiple_content_types() {
-        // Test various file types from tests/content/
+    fn test_multiple_content_types_with_caching() {
+        // Test various file types from tests/content/ - now with cache validation
         let test_cases = vec![
             ("/test.svg", "image/svg+xml"),
             ("/style.css", "text/css; charset=utf-8"),
@@ -156,13 +177,216 @@ mod http_integration_tests {
                         "Failed for {}: Expected 200 OK", path);
                     assert!(response.contains(&format!("Content-Type: {}", expected_content_type)), 
                         "Failed for {}: Expected Content-Type: {}", path, expected_content_type);
-                    println!("✓ {} served with correct Content-Type: {}", path, expected_content_type);
+                    
+                    // Validate caching headers are present
+                    assert!(response.contains("ETag: W/"), 
+                        "File {} should have cached ETag header", path);
+                    assert!(response.contains("Last-Modified:"), 
+                        "File {} should have cached Last-Modified header", path);
+                    assert!(response.contains("Cache-Control: public, max-age=3600"), 
+                        "File {} should have cache control headers", path);
+                    
+                    println!("✓ {} served with correct Content-Type: {} and cache headers", path, expected_content_type);
                 }
                 Err(_) => {
                     println!("Warning: Server not running from tests/content/, skipping {}", path);
                 }
             }
         }
+    }
+    
+    fn send_conditional_request(path: &str, if_modified_since: Option<&str>, if_none_match: Option<&str>) -> Result<String, std::io::Error> {
+        let mut stream = TcpStream::connect("127.0.0.1:8080")?;
+        let mut request = format!("GET {} HTTP/1.1\r\nHost: localhost\r\n", path);
+        
+        if let Some(modified_since) = if_modified_since {
+            request.push_str(&format!("If-Modified-Since: {}\r\n", modified_since));
+        }
+        
+        if let Some(none_match) = if_none_match {
+            request.push_str(&format!("If-None-Match: {}\r\n", none_match));
+        }
+        
+        request.push_str("\r\n");
+        stream.write_all(request.as_bytes())?;
+        
+        let mut response = String::new();
+        stream.read_to_string(&mut response)?;
+        
+        Ok(response)
+    }
+
+    #[test]
+    #[ignore] // Requires server to be running from tests/content/
+    fn test_etag_headers_present() {
+        match send_get_request("/index.html") {
+            Ok(response) => {
+                assert!(response.contains("HTTP/1.1 200 OK"));
+                assert!(response.contains("ETag: W/"), "Response should contain weak ETag header");
+                assert!(response.contains("Last-Modified: timestamp_"), "Response should contain Last-Modified header");
+                assert!(response.contains("Cache-Control: public, max-age=3600"), "Response should contain cache control");
+                println!("✓ ETag and caching headers present in response");
+            }
+            Err(_) => {
+                println!("Warning: Server not running from tests/content/, skipping ETag test");
+            }
+        }
+    }
+
+    #[test]
+    #[ignore] // Requires server to be running from tests/content/
+    fn test_conditional_request_etag_match() {
+        // First, get the file to extract its ETag
+        let initial_response = match send_get_request("/index.html") {
+            Ok(response) => response,
+            Err(_) => {
+                println!("Warning: Server not running from tests/content/, skipping conditional request test");
+                return;
+            }
+        };
+
+        // Extract ETag from response headers
+        let etag = if let Some(start) = initial_response.find("ETag: ") {
+            let etag_line = &initial_response[start..];
+            if let Some(end) = etag_line.find("\r\n") {
+                let full_etag = &etag_line[6..end]; // Skip "ETag: "
+                Some(full_etag)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        if let Some(etag_value) = etag {
+            println!("Found ETag: {}", etag_value);
+            
+            // Test If-None-Match with matching ETag should return 304
+            match send_conditional_request("/index.html", None, Some(etag_value)) {
+                Ok(response) => {
+                    assert!(response.contains("HTTP/1.1 304 Not Modified"), 
+                        "Matching ETag should return 304 Not Modified, got: {}", response);
+                    assert!(response.contains("Cache-Control: public, max-age=3600"), 
+                        "304 response should contain cache control headers");
+                    println!("✓ If-None-Match with matching ETag returned 304");
+                }
+                Err(e) => {
+                    println!("Error testing conditional request: {}", e);
+                }
+            }
+            
+            // Test If-None-Match with non-matching ETag should return 200
+            match send_conditional_request("/index.html", None, Some("W/\"999-999\"")) {
+                Ok(response) => {
+                    assert!(response.contains("HTTP/1.1 200 OK"), 
+                        "Non-matching ETag should return 200 OK, got: {}", response);
+                    println!("✓ If-None-Match with non-matching ETag returned 200");
+                }
+                Err(e) => {
+                    println!("Error testing non-matching ETag: {}", e);
+                }
+            }
+        } else {
+            println!("Could not extract ETag from response");
+        }
+    }
+
+    #[test]
+    #[ignore] // Requires server to be running from tests/content/
+    fn test_conditional_request_wildcard_etag() {
+        // Test If-None-Match with wildcard should always return 304
+        match send_conditional_request("/index.html", None, Some("*")) {
+            Ok(response) => {
+                assert!(response.contains("HTTP/1.1 304 Not Modified"), 
+                    "Wildcard ETag should return 304 Not Modified, got: {}", response);
+                println!("✓ If-None-Match with wildcard ETag returned 304");
+            }
+            Err(_) => {
+                println!("Warning: Server not running from tests/content/, skipping wildcard ETag test");
+            }
+        }
+    }
+
+    #[test]
+    #[ignore] // Requires server to be running from tests/content/
+    fn test_conditional_request_if_modified_since() {
+        // First, get the file to extract its Last-Modified timestamp
+        let initial_response = match send_get_request("/index.html") {
+            Ok(response) => response,
+            Err(_) => {
+                println!("Warning: Server not running from tests/content/, skipping If-Modified-Since test");
+                return;
+            }
+        };
+
+        // Extract Last-Modified timestamp from response headers
+        let last_modified = if let Some(start) = initial_response.find("Last-Modified: ") {
+            let modified_line = &initial_response[start..];
+            if let Some(end) = modified_line.find("\r\n") {
+                let timestamp = &modified_line[15..end]; // Skip "Last-Modified: "
+                Some(timestamp)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        if let Some(timestamp) = last_modified {
+            println!("Found Last-Modified: {}", timestamp);
+            
+            // Test If-Modified-Since with same timestamp should return 304
+            match send_conditional_request("/index.html", Some(timestamp), None) {
+                Ok(response) => {
+                    assert!(response.contains("HTTP/1.1 304 Not Modified"), 
+                        "Same timestamp should return 304 Not Modified, got: {}", response);
+                    println!("✓ If-Modified-Since with same timestamp returned 304");
+                }
+                Err(e) => {
+                    println!("Error testing If-Modified-Since: {}", e);
+                }
+            }
+            
+            // Test If-Modified-Since with older timestamp should return 200
+            match send_conditional_request("/index.html", Some("timestamp_0"), None) {
+                Ok(response) => {
+                    assert!(response.contains("HTTP/1.1 200 OK"), 
+                        "Older timestamp should return 200 OK, got: {}", response);
+                    println!("✓ If-Modified-Since with older timestamp returned 200");
+                }
+                Err(e) => {
+                    println!("Error testing older timestamp: {}", e);
+                }
+            }
+        } else {
+            println!("Could not extract Last-Modified from response");
+        }
+    }
+
+    #[test]
+    #[ignore] // Requires server to be running from tests/content/
+    fn test_head_request_with_cache_headers() {
+        let mut stream = TcpStream::connect("127.0.0.1:8080").unwrap_or_else(|_| {
+            panic!("Server not running");
+        });
+        
+        let request = "HEAD /index.html HTTP/1.1\r\nHost: localhost\r\n\r\n";
+        stream.write_all(request.as_bytes()).unwrap();
+        
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        
+        assert!(response.contains("HTTP/1.1 200 OK"));
+        assert!(response.contains("ETag: W/"), "HEAD response should contain ETag");
+        assert!(response.contains("Last-Modified:"), "HEAD response should contain Last-Modified");
+        assert!(response.contains("Content-Length:"), "HEAD response should contain Content-Length");
+        
+        // HEAD response should not contain body
+        let body_start = response.find("\r\n\r\n").unwrap() + 4;
+        let body = &response[body_start..];
+        assert!(body.is_empty() || body.trim().is_empty(), "HEAD response should not contain body");
+        
+        println!("✓ HEAD request with cache headers test passed");
     }
 }
 

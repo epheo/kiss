@@ -506,3 +506,249 @@ mod benchmark_tests {
         assert!(ops_per_sec > 200000.0, "MIME type detection should be >200k ops/sec");
     }
 }
+
+#[cfg(test)]
+mod cache_performance_tests {
+    use super::*;
+
+    fn send_request_with_timing(path: &str) -> Result<(String, std::time::Duration), std::io::Error> {
+        let start = Instant::now();
+        
+        let mut stream = TcpStream::connect("127.0.0.1:8080")?;
+        let request = format!("GET {} HTTP/1.1\r\nHost: localhost\r\n\r\n", path);
+        
+        stream.write_all(request.as_bytes())?;
+        
+        // Parse HTTP response properly (headers + body)
+        let response = read_http_response(&mut stream)?;
+        
+        let duration = start.elapsed();
+        Ok((response, duration))
+    }
+
+    fn send_conditional_request_with_timing(
+        path: &str,
+        if_none_match: Option<&str>,
+    ) -> Result<(String, std::time::Duration), std::io::Error> {
+        let start = Instant::now();
+        
+        let mut stream = TcpStream::connect("127.0.0.1:8080")?;
+        let mut request = format!("GET {} HTTP/1.1\r\nHost: localhost\r\n", path);
+        
+        if let Some(etag) = if_none_match {
+            request.push_str(&format!("If-None-Match: {}\r\n", etag));
+        }
+        
+        request.push_str("\r\n");
+        stream.write_all(request.as_bytes())?;
+        
+        // Parse HTTP response properly (headers + optional body)
+        let response = read_http_response(&mut stream)?;
+        
+        let duration = start.elapsed();
+        Ok((response, duration))
+    }
+
+    fn read_http_response(stream: &mut TcpStream) -> Result<String, std::io::Error> {
+        use std::io::BufRead;
+        let mut reader = std::io::BufReader::new(stream);
+        let mut response = String::new();
+        let mut content_length: Option<usize> = None;
+        let mut is_304_or_head = false;
+        
+        // Read status line
+        let mut line = String::new();
+        reader.read_line(&mut line)?;
+        response.push_str(&line);
+        
+        // Check if this is a 304 response
+        if line.contains("304 Not Modified") {
+            is_304_or_head = true;
+        }
+        
+        // Read headers
+        loop {
+            line.clear();
+            reader.read_line(&mut line)?;
+            response.push_str(&line);
+            
+            if line.trim().is_empty() {
+                // End of headers
+                break;
+            }
+            
+            // Parse Content-Length if present
+            if line.to_lowercase().starts_with("content-length:") {
+                if let Some(value) = line.split(':').nth(1) {
+                    content_length = value.trim().parse().ok();
+                }
+            }
+        }
+        
+        // Read body only if not a 304/HEAD response and has Content-Length
+        if !is_304_or_head {
+            if let Some(length) = content_length {
+                let mut body = vec![0u8; length];
+                std::io::Read::read_exact(reader.get_mut(), &mut body)?;
+                response.push_str(&String::from_utf8_lossy(&body));
+            }
+        }
+        
+        Ok(response)
+    }
+
+    #[test]
+    #[ignore] // Requires server to be running from tests/content/
+    fn test_cache_performance_benefits() {
+        // Test multiple requests to the same file to see cache benefits
+        let test_file = "/index.html";
+        let num_requests = 10;
+        
+        let mut response_times = Vec::new();
+        let mut first_etag = None;
+        
+        println!("Testing {} requests to {}", num_requests, test_file);
+        
+        // Make multiple requests and measure response times
+        for i in 0..num_requests {
+            match send_request_with_timing(test_file) {
+                Ok((response, duration)) => {
+                    assert!(response.contains("HTTP/1.1 200 OK"), "Request {} failed", i + 1);
+                    response_times.push(duration);
+                    
+                    // Extract ETag from first response
+                    if i == 0 {
+                        if let Some(start) = response.find("ETag: ") {
+                            let etag_line = &response[start..];
+                            if let Some(end) = etag_line.find("\r\n") {
+                                first_etag = Some(etag_line[6..end].to_string());
+                            }
+                        }
+                    }
+                    
+                    println!("Request {}: {:?}", i + 1, duration);
+                }
+                Err(e) => {
+                    println!("Warning: Request {} failed: {}, skipping performance test", i + 1, e);
+                    return;
+                }
+            }
+        }
+        
+        // Calculate average response time for cached requests (requests 2-10)
+        let cached_times: Vec<_> = response_times.iter().skip(1).collect();
+        let avg_cached_time = cached_times.iter().map(|d| d.as_nanos()).sum::<u128>() as f64 / cached_times.len() as f64;
+        let first_request_time = response_times[0].as_nanos() as f64;
+        
+        println!("First request time: {:.2}ms", first_request_time / 1_000_000.0);
+        println!("Average cached request time: {:.2}ms", avg_cached_time / 1_000_000.0);
+        
+        // With file header caching, subsequent requests should be very fast
+        // They should use pre-compiled headers without filesystem metadata calls
+        assert!(avg_cached_time < first_request_time * 2.0, 
+            "Cached requests should be at least as fast as first request");
+        
+        // Test 304 Not Modified performance if we have an ETag
+        if let Some(etag) = first_etag {
+            println!("Testing 304 Not Modified performance with ETag: {}", etag);
+            
+            let mut not_modified_times = Vec::new();
+            for i in 0..5 {
+                match send_conditional_request_with_timing(test_file, Some(&etag)) {
+                    Ok((response, duration)) => {
+                        assert!(response.contains("HTTP/1.1 304 Not Modified"), 
+                            "Conditional request {} should return 304", i + 1);
+                        not_modified_times.push(duration);
+                        println!("304 Request {}: {:?}", i + 1, duration);
+                    }
+                    Err(e) => {
+                        println!("Warning: 304 request {} failed: {}", i + 1, e);
+                    }
+                }
+            }
+            
+            if !not_modified_times.is_empty() {
+                let avg_304_time = not_modified_times.iter().map(|d| d.as_nanos()).sum::<u128>() as f64 / not_modified_times.len() as f64;
+                println!("Average 304 Not Modified time: {:.2}ms", avg_304_time / 1_000_000.0);
+                
+                // 304 responses should be faster than full responses since no file I/O
+                assert!(avg_304_time < avg_cached_time, 
+                    "304 responses should be faster than full cached responses");
+            }
+        }
+        
+        println!("✓ Cache performance test completed");
+    }
+
+    #[test]
+    #[ignore] // Requires server to be running from tests/content/
+    fn test_304_response_performance() {
+        // Test performance of 304 Not Modified responses specifically
+        let test_file = "/index.html";
+        
+        // First, get the ETag
+        let initial_response = match send_request_with_timing(test_file) {
+            Ok((response, _)) => response,
+            Err(_) => {
+                println!("Warning: Cannot get initial response, skipping 304 performance test");
+                return;
+            }
+        };
+
+        let etag = if let Some(start) = initial_response.find("ETag: ") {
+            let etag_line = &initial_response[start..];
+            if let Some(end) = etag_line.find("\r\n") {
+                Some(etag_line[6..end].to_string())
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        if let Some(etag_value) = etag {
+            println!("Testing 304 Not Modified performance with ETag: {}", etag_value);
+            
+            const NUM_304_REQUESTS: usize = 50;
+            let start_time = Instant::now();
+            let mut successful_304s = 0;
+            let mut total_304_time = Duration::ZERO;
+            
+            for i in 0..NUM_304_REQUESTS {
+                match send_conditional_request_with_timing(test_file, Some(&etag_value)) {
+                    Ok((response, duration)) => {
+                        if response.contains("HTTP/1.1 304 Not Modified") {
+                            successful_304s += 1;
+                            total_304_time += duration;
+                        }
+                    }
+                    Err(_) => {
+                        println!("Warning: 304 request {} failed", i + 1);
+                    }
+                }
+            }
+            
+            let total_duration = start_time.elapsed();
+            let rps_304 = successful_304s as f64 / total_duration.as_secs_f64();
+            let avg_304_time = if successful_304s > 0 {
+                total_304_time / successful_304s as u32
+            } else {
+                Duration::ZERO
+            };
+            
+            println!("304 Not Modified performance:");
+            println!("  {} successful 304s in {:?}", successful_304s, total_duration);
+            println!("  {:.2} req/s", rps_304);
+            println!("  Average response time: {:?}", avg_304_time);
+            
+            // 304 responses should be very fast - no file I/O, minimal processing
+            assert!(rps_304 > 200.0, "304 throughput too low: {:.2} req/s", rps_304);
+            assert!(avg_304_time < Duration::from_millis(10), 
+                "304 response time too high: {:?}", avg_304_time);
+            assert!(successful_304s >= NUM_304_REQUESTS * 9 / 10, 
+                "304 success rate too low: {}/{}", successful_304s, NUM_304_REQUESTS);
+        }
+        
+        println!("✓ 304 Not Modified performance test completed");
+    }
+}
