@@ -33,50 +33,61 @@ struct FileMetadata {
 static HEADER_TEMPLATES: OnceCell<HeaderTemplates> = OnceCell::new();
 static FILE_CACHE: OnceCell<HashMap<String, FileMetadata>> = OnceCell::new();
 
-// Pre-compiled response header templates
+// Pre-compiled response templates split into headers and bodies for unified handling
 #[derive(Debug)]
 struct HeaderTemplates {
+    // Error responses (headers + body combined for simplicity since they're small)
     not_found: Vec<u8>,
     method_not_allowed: Vec<u8>,
     request_too_large: Vec<u8>,
-    // file_too_large removed - files are validated during cache building
     bad_request: Vec<u8>,
     request_timeout: Vec<u8>,
-    health_response: Vec<u8>,
-    ready_response: Vec<u8>,
+    not_modified: Vec<u8>,
+    
+    // Health endpoint responses (split for optimized handling)
+    health_headers: Vec<u8>,
+    health_body: Vec<u8>,
+    ready_headers: Vec<u8>,
+    ready_body: Vec<u8>,
 }
 
 impl HeaderTemplates {
     fn new() -> Self {
+        let (health_headers, health_body) = Self::create_health_response();
+        let (ready_headers, ready_body) = Self::create_ready_response();
+        
         Self {
             not_found: b"HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nContent-Length: 14\r\nX-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nContent-Security-Policy: default-src 'self'; style-src 'self' 'unsafe-inline' https:; script-src 'self' 'unsafe-inline' https:; img-src 'self' data: blob: https:; font-src 'self' data: https:; object-src 'self' data:; base-uri 'self'\r\nConnection: keep-alive\r\n\r\nFile not found".to_vec(),
             method_not_allowed: b"HTTP/1.1 405 Method Not Allowed\r\nContent-Type: text/plain\r\nContent-Length: 18\r\nX-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nContent-Security-Policy: default-src 'self'; style-src 'self' 'unsafe-inline' https:; script-src 'self' 'unsafe-inline' https:; img-src 'self' data: blob: https:; font-src 'self' data: https:; object-src 'self' data:; base-uri 'self'\r\nConnection: keep-alive\r\n\r\nMethod not allowed".to_vec(),
             request_too_large: b"HTTP/1.1 413 Request Entity Too Large\r\nContent-Type: text/plain\r\nContent-Length: 17\r\nX-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nContent-Security-Policy: default-src 'self'; style-src 'self' 'unsafe-inline' https:; script-src 'self' 'unsafe-inline' https:; img-src 'self' data: blob: https:; font-src 'self' data: https:; object-src 'self' data:; base-uri 'self'\r\nConnection: keep-alive\r\n\r\nRequest too large".to_vec(),
-            // file_too_large removed - validation moved to cache building
             bad_request: b"HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\nContent-Length: 17\r\nX-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nContent-Security-Policy: default-src 'self'; style-src 'self' 'unsafe-inline' https:; script-src 'self' 'unsafe-inline' https:; img-src 'self' data: blob: https:; font-src 'self' data: https:; object-src 'self' data:; base-uri 'self'\r\nConnection: keep-alive\r\n\r\nMalformed request".to_vec(),
             request_timeout: b"HTTP/1.1 408 Request Timeout\r\nContent-Type: text/plain\r\nContent-Length: 15\r\nX-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nContent-Security-Policy: default-src 'self'; style-src 'self' 'unsafe-inline' https:; script-src 'self' 'unsafe-inline' https:; img-src 'self' data: blob: https:; font-src 'self' data: https:; object-src 'self' data:; base-uri 'self'\r\nConnection: keep-alive\r\n\r\nRequest timeout".to_vec(),
-            health_response: Self::create_health_response(),
-            ready_response: Self::create_ready_response(),
+            not_modified: b"HTTP/1.1 304 Not Modified\r\nCache-Control: public, max-age=3600\r\nConnection: keep-alive\r\n\r\n".to_vec(),
+            
+            health_headers,
+            health_body,
+            ready_headers,
+            ready_body,
         }
     }
     
     
-    fn create_health_response() -> Vec<u8> {
-        let health_status = r#"{"status":"healthy","timestamp":"0"}"#;
+    fn create_health_response() -> (Vec<u8>, Vec<u8>) {
+        let body = br#"{"status":"healthy","timestamp":"0"}"#.to_vec();
         let headers = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nX-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nContent-Security-Policy: default-src 'self'; style-src 'self' 'unsafe-inline' https:; script-src 'self' 'unsafe-inline' https:; img-src 'self' data: blob: https:; font-src 'self' data: https:; object-src 'self' data:; base-uri 'self'\r\nConnection: keep-alive\r\n\r\n{}",
-            health_status.len(), health_status
-        );
-        headers.into_bytes()
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nX-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nContent-Security-Policy: default-src 'self'; style-src 'self' 'unsafe-inline' https:; script-src 'self' 'unsafe-inline' https:; img-src 'self' data: blob: https:; font-src 'self' data: https:; object-src 'self' data:; base-uri 'self'\r\nConnection: keep-alive\r\n\r\n",
+            body.len()
+        ).into_bytes();
+        (headers, body)
     }
     
-    fn create_ready_response() -> Vec<u8> {
-        let ready_status = r#"{"status":"ready","timestamp":"0"}"#;
+    fn create_ready_response() -> (Vec<u8>, Vec<u8>) {
+        let body = br#"{"status":"ready","timestamp":"0"}"#.to_vec();
         let headers = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nX-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nContent-Security-Policy: default-src 'self'; style-src 'self' 'unsafe-inline' https:; script-src 'self' 'unsafe-inline' https:; img-src 'self' data: blob: https:; font-src 'self' data: https:; object-src 'self' data:; base-uri 'self'\r\nConnection: keep-alive\r\n\r\n{}",
-            ready_status.len(), ready_status
-        );
-        headers.into_bytes()
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nX-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nContent-Security-Policy: default-src 'self'; style-src 'self' 'unsafe-inline' https:; script-src 'self' 'unsafe-inline' https:; img-src 'self' data: blob: https:; font-src 'self' data: https:; object-src 'self' data:; base-uri 'self'\r\nConnection: keep-alive\r\n\r\n",
+            body.len()
+        ).into_bytes();
+        (headers, body)
     }
 }
 
@@ -310,9 +321,16 @@ fn generate_file_metadata(file_path: &std::path::Path, relative_path: &str) -> R
     let last_modified_str = httpdate::fmt_http_date(last_modified);
     
     // Pre-generate complete HTTP headers - eliminates all runtime allocations
+    // Conditionally include X-Frame-Options (exclude for SVG to allow <object> embedding)
+    let x_frame_options = if mime_type_str == "image/svg+xml" {
+        ""
+    } else {
+        "X-Frame-Options: DENY\r\n"
+    };
+    
     let headers = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\nLast-Modified: {}\r\nETag: {}\r\nCache-Control: public, max-age=3600\r\nX-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nContent-Security-Policy: default-src 'self'; style-src 'self' 'unsafe-inline' https:; script-src 'self' 'unsafe-inline' https:; img-src 'self' data: blob: https:; font-src 'self' data: https:; object-src 'self' data:; base-uri 'self'\r\nConnection: keep-alive\r\n\r\n",
-        mime_type_str, size, last_modified_str, etag
+        "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\nLast-Modified: {}\r\nETag: {}\r\nCache-Control: public, max-age=3600\r\nX-Content-Type-Options: nosniff\r\n{}Content-Security-Policy: default-src 'self'; style-src 'self' 'unsafe-inline' https:; script-src 'self' 'unsafe-inline' https:; img-src 'self' data: blob: https:; font-src 'self' data: https:; object-src 'self' data:; base-uri 'self'\r\nConnection: keep-alive\r\n\r\n",
+        mime_type_str, size, last_modified_str, etag, x_frame_options
     ).into_bytes();
     
     // Pre-compute file path - eliminates runtime string building
@@ -409,7 +427,8 @@ async fn handle_connection(mut stream: TcpStream) {
     .await;
 
     if connection_result.is_err() {
-        let _ = send_precompiled_response(&mut stream, &HEADER_TEMPLATES.get().unwrap().request_timeout).await;
+        let _ = stream.write_all(&HEADER_TEMPLATES.get().unwrap().request_timeout).await;
+        let _ = stream.flush().await;
     }
 }
 
@@ -434,7 +453,8 @@ async fn handle_connection_inner(stream: &mut TcpStream) -> Result<(), Box<dyn s
             Ok(Ok(0)) | Err(_) => break, // Connection closed or timeout
             Ok(Err(_)) => break,         // Read error
             Ok(Ok(size)) if size > MAX_REQUEST_SIZE => {
-                send_precompiled_response(reader.get_mut(), &HEADER_TEMPLATES.get().unwrap().request_too_large).await?;
+                reader.get_mut().write_all(&HEADER_TEMPLATES.get().unwrap().request_too_large).await?;
+                reader.get_mut().flush().await?;
                 break;
             }
             Ok(Ok(_)) => {}
@@ -449,13 +469,15 @@ async fn handle_connection_inner(stream: &mut TcpStream) -> Result<(), Box<dyn s
         let (method, path, version) = match parse_request_line_fast(request_bytes) {
             Some((m, p, v)) => (m, p, v),
             None => {
-                send_precompiled_response(reader.get_mut(), &HEADER_TEMPLATES.get().unwrap().bad_request).await?;
+                reader.get_mut().write_all(&HEADER_TEMPLATES.get().unwrap().bad_request).await?;
+                reader.get_mut().flush().await?;
                 break;
             }
         };
 
         if method != b"GET" && method != b"HEAD" {
-            send_precompiled_response(reader.get_mut(), &HEADER_TEMPLATES.get().unwrap().method_not_allowed).await?;
+            reader.get_mut().write_all(&HEADER_TEMPLATES.get().unwrap().method_not_allowed).await?;
+            reader.get_mut().flush().await?;
             break;
         }
 
@@ -527,13 +549,25 @@ async fn handle_request(
     if_modified_since: Option<&str>,
     if_none_match: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Handle health check endpoints with pre-compiled responses (optimized for performance)
+    // Handle health check endpoints using unified response pattern
+    let templates = HEADER_TEMPLATES.get().unwrap();
+    
     if path == "/health" {
-        return send_response(stream, &HEADER_TEMPLATES.get().unwrap().health_response, is_head).await;
+        stream.write_all(&templates.health_headers).await?;
+        if !is_head {
+            stream.write_all(&templates.health_body).await?;
+        }
+        stream.flush().await?;
+        return Ok(());
     }
 
     if path == "/ready" {
-        return send_response(stream, &HEADER_TEMPLATES.get().unwrap().ready_response, is_head).await;
+        stream.write_all(&templates.ready_headers).await?;
+        if !is_head {
+            stream.write_all(&templates.ready_body).await?;
+        }
+        stream.flush().await?;
+        return Ok(());
     }
 
     serve_static_file(stream, path, is_head, if_modified_since, if_none_match).await
@@ -570,7 +604,9 @@ async fn serve_static_file(
             &file_metadata.etag,
         ) {
             if should_return_304 {
-                return send_not_modified_response(stream).await;
+                stream.write_all(&HEADER_TEMPLATES.get().unwrap().not_modified).await?;
+                stream.flush().await?;
+                return Ok(());
             }
         }
 
@@ -586,14 +622,18 @@ async fn serve_static_file(
                 }
                 Err(_) => {
                     // File disappeared since cache was built - should be rare
-                    return send_precompiled_response(stream, &HEADER_TEMPLATES.get().unwrap().not_found).await;
+                    stream.write_all(&HEADER_TEMPLATES.get().unwrap().not_found).await?;
+                    stream.flush().await?;
+                    return Ok(());
                 }
             }
         }
         stream.flush().await?;
     } else {
         // File not in cache - return 404
-        return send_precompiled_response(stream, &HEADER_TEMPLATES.get().unwrap().not_found).await;
+        stream.write_all(&HEADER_TEMPLATES.get().unwrap().not_found).await?;
+        stream.flush().await?;
+        return Ok(());
     }
 
     Ok(())
@@ -660,44 +700,6 @@ fn is_not_modified_since(modified_since_str: &str, last_modified: &SystemTime) -
     }
 }
 
-// Unified response handler that supports all response types
-async fn send_response(
-    stream: &mut TcpStream,
-    response_data: &[u8],
-    is_head: bool,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    if is_head {
-        // For HEAD requests, extract and send only headers
-        let header_end = response_data.windows(4).position(|w| w == b"\r\n\r\n")
-            .map(|pos| pos + 4)
-            .unwrap_or(response_data.len());
-        stream.write_all(&response_data[..header_end]).await?;
-    } else {
-        // For GET requests, send the full response
-        stream.write_all(response_data).await?;
-    }
-    stream.flush().await?;
-    Ok(())
-}
-
-// Convenience function for simple precompiled responses (GET only)
-async fn send_precompiled_response(
-    stream: &mut TcpStream,
-    response: &[u8],
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    send_response(stream, response, false).await
-}
-
-// 304 Not Modified response - headers only, no body
-async fn send_not_modified_response(
-    stream: &mut TcpStream,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let response = b"HTTP/1.1 304 Not Modified\r\nCache-Control: public, max-age=3600\r\nConnection: keep-alive\r\n\r\n";
-    // 304 responses never have a body, regardless of request method
-    stream.write_all(response).await?;
-    stream.flush().await?;
-    Ok(())
-}
 
 
 
