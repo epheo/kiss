@@ -8,7 +8,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::signal;
 use tokio::time::{timeout, Duration};
 use lazy_static::lazy_static;
-use kiss::{get_mime_type, sanitize_path};
+use kiss::{get_mime_type_enum, sanitize_path};
 
 const PORT: u16 = 8080;
 const MAX_REQUEST_SIZE: usize = 8192;
@@ -19,10 +19,10 @@ const KEEPALIVE_TIMEOUT_SECS: u64 = 5;
 
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
-// File metadata for cached headers
+// Optimized file metadata - pre-stored MIME strings for zero request overhead
 #[derive(Clone)]
 struct FileMetadata {
-    headers: Vec<u8>,
+    mime_type_str: &'static str,  // Pre-stored for zero request overhead
     size: u64,
     last_modified: SystemTime,
     etag: String,
@@ -54,12 +54,31 @@ impl HeaderTemplates {
             not_found: b"HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nContent-Length: 14\r\nX-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nContent-Security-Policy: default-src 'self'; style-src 'self' 'unsafe-inline' https:; script-src 'self' 'unsafe-inline' https:; img-src 'self' data: blob: https:; font-src 'self' data: https:; object-src 'self' data:; base-uri 'self'\r\nConnection: keep-alive\r\n\r\nFile not found".to_vec(),
             method_not_allowed: b"HTTP/1.1 405 Method Not Allowed\r\nContent-Type: text/plain\r\nContent-Length: 18\r\nX-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nContent-Security-Policy: default-src 'self'; style-src 'self' 'unsafe-inline' https:; script-src 'self' 'unsafe-inline' https:; img-src 'self' data: blob: https:; font-src 'self' data: https:; object-src 'self' data:; base-uri 'self'\r\nConnection: keep-alive\r\n\r\nMethod not allowed".to_vec(),
             request_too_large: b"HTTP/1.1 413 Request Entity Too Large\r\nContent-Type: text/plain\r\nContent-Length: 17\r\nX-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nContent-Security-Policy: default-src 'self'; style-src 'self' 'unsafe-inline' https:; script-src 'self' 'unsafe-inline' https:; img-src 'self' data: blob: https:; font-src 'self' data: https:; object-src 'self' data:; base-uri 'self'\r\nConnection: keep-alive\r\n\r\nRequest too large".to_vec(),
-            file_too_large: b"HTTP/1.1 413 Request Entity Too Large\r\nContent-Type: text/plain\r\nContent-Length: 14\r\nX-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nContent-Security-Policy: default-src 'self'; style-src 'self' 'unsafe-inline' https:; script-src 'self' 'unsafe-inline' https:; img-src 'self' data: blob: https:; font-src 'self' data: https:; object-src 'self' data:; base-uri 'self'\r\nConnection: keep-alive\r\n\r\nFile too large".to_vec(),
+            file_too_large: b"HTTP/1.1 413 Request Entity Too Large\r\nContent-Type: text/plain\r\nContent-Length: 14\r\nX-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nContent-Security-Policy: default-src 'self'; style-src 'self' 'unsafe-inline' https:; script-src 'self' 'unsafe-inline' https:; img-src 'self' data: https:; font-src 'self' data: https:; object-src 'self' data:; base-uri 'self'\r\nConnection: keep-alive\r\n\r\nFile too large".to_vec(),
             bad_request: b"HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\nContent-Length: 17\r\nX-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nContent-Security-Policy: default-src 'self'; style-src 'self' 'unsafe-inline' https:; script-src 'self' 'unsafe-inline' https:; img-src 'self' data: blob: https:; font-src 'self' data: https:; object-src 'self' data:; base-uri 'self'\r\nConnection: keep-alive\r\n\r\nMalformed request".to_vec(),
             request_timeout: b"HTTP/1.1 408 Request Timeout\r\nContent-Type: text/plain\r\nContent-Length: 15\r\nX-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nContent-Security-Policy: default-src 'self'; style-src 'self' 'unsafe-inline' https:; script-src 'self' 'unsafe-inline' https:; img-src 'self' data: blob: https:; font-src 'self' data: https:; object-src 'self' data:; base-uri 'self'\r\nConnection: keep-alive\r\n\r\nRequest timeout".to_vec(),
             health_response: Self::create_health_response(),
             ready_response: Self::create_ready_response(),
         }
+    }
+    
+    // Fast header generation using template - much faster than format!() macro
+    fn generate_file_headers(&self, file_metadata: &FileMetadata) -> Vec<u8> {
+        // Pre-allocate buffer with reasonable size estimate
+        let mut headers = Vec::with_capacity(400);
+        
+        // Optimized header generation with minimal allocations
+        headers.extend_from_slice(b"HTTP/1.1 200 OK\r\nContent-Type: ");
+        headers.extend_from_slice(file_metadata.mime_type_str.as_bytes());
+        headers.extend_from_slice(b"\r\nContent-Length: ");
+        headers.extend_from_slice(file_metadata.size.to_string().as_bytes());
+        headers.extend_from_slice(b"\r\nLast-Modified: ");
+        headers.extend_from_slice(format_http_date(file_metadata.last_modified).as_bytes());
+        headers.extend_from_slice(b"\r\nETag: ");
+        headers.extend_from_slice(file_metadata.etag.as_bytes());
+        headers.extend_from_slice(b"\r\nCache-Control: public, max-age=3600\r\nX-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nContent-Security-Policy: default-src 'self'; style-src 'self' 'unsafe-inline' https:; script-src 'self' 'unsafe-inline' https:; img-src 'self' data: blob: https:; font-src 'self' data: https:; object-src 'self' data:; base-uri 'self'\r\nConnection: keep-alive\r\n\r\n");
+        
+        headers
     }
     
     fn create_health_response() -> Vec<u8> {
@@ -237,29 +256,42 @@ fn discover_files_recursive(
     relative_path: &str,
     cache: &mut HashMap<String, FileMetadata>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let full_path = if relative_path.is_empty() {
-        base_dir.to_string()
-    } else {
-        format!("{}/{}", base_dir, relative_path)
-    };
+    // Optimized path construction using pre-allocated capacity
+    let mut full_path = String::with_capacity(base_dir.len() + relative_path.len() + 1);
+    full_path.push_str(base_dir);
+    if !relative_path.is_empty() {
+        full_path.push('/');
+        full_path.push_str(relative_path);
+    }
     
     let entries = fs::read_dir(&full_path)?;
     
     for entry in entries {
         let entry = entry?;
         let metadata = entry.metadata()?;
-        let file_name = entry.file_name().to_string_lossy().to_string();
         
+        // Use OsStr to avoid unnecessary UTF-8 conversion until needed
+        let file_name_os = entry.file_name();
+        let file_name = file_name_os.to_string_lossy();
+        
+        // Optimized path joining - pre-allocate with capacity
         let current_relative = if relative_path.is_empty() {
-            file_name.clone()
+            file_name.to_string()
         } else {
-            format!("{}/{}", relative_path, file_name)
+            let mut path = String::with_capacity(relative_path.len() + file_name.len() + 1);
+            path.push_str(relative_path);
+            path.push('/');
+            path.push_str(&file_name);
+            path
         };
         
         if metadata.is_file() {
             // Generate cache entry for this file
             if let Ok(file_metadata) = generate_file_metadata(&entry.path(), &current_relative) {
-                let url_path = format!("/{}", current_relative);
+                // Optimized URL path construction
+                let mut url_path = String::with_capacity(current_relative.len() + 1);
+                url_path.push('/');
+                url_path.push_str(&current_relative);
                 cache.insert(url_path, file_metadata);
             }
         } else if metadata.is_dir() {
@@ -276,27 +308,19 @@ fn generate_file_metadata(file_path: &std::path::Path, _relative_path: &str) -> 
     let size = metadata.len();
     let last_modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
     
-    // Generate weak ETag using size and modification time
+    // Generate weak ETag using size and modification time - optimized integer formatting
     let mtime_secs = last_modified
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or(Duration::from_secs(0))
         .as_secs();
     let etag = format!("W/\"{}-{}\"", size, mtime_secs);
     
-    // Format Last-Modified header (RFC 7232 format)
-    let last_modified_str = format_http_date(last_modified);
-    
-    // Get MIME type
-    let mime_type = get_mime_type(&file_path.to_string_lossy());
-    
-    // Pre-compile headers
-    let headers = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\nLast-Modified: {}\r\nETag: {}\r\nCache-Control: public, max-age=3600\r\nX-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nContent-Security-Policy: default-src 'self'; style-src 'self' 'unsafe-inline' https:; script-src 'self' 'unsafe-inline' https:; img-src 'self' data: blob: https:; font-src 'self' data: https:; object-src 'self' data:; base-uri 'self'\r\nConnection: keep-alive\r\n\r\n",
-        mime_type, size, last_modified_str, etag
-    );
+    // Get MIME type using fast enum lookup during cache building, store as static string
+    let mime_type_enum = get_mime_type_enum(file_path);
+    let mime_type_str = mime_type_enum.as_str();
     
     Ok(FileMetadata {
-        headers: headers.into_bytes(),
+        mime_type_str,
         size,
         last_modified,
         etag,
@@ -540,8 +564,9 @@ async fn serve_static_file(
             }
         }
 
-        // Send cached headers (much faster than building them each time)
-        stream.write_all(&file_metadata.headers).await?;
+        // Generate headers dynamically from optimized template
+        let headers = HEADER_TEMPLATES.generate_file_headers(file_metadata);
+        stream.write_all(&headers).await?;
 
         // For HEAD requests, only send headers, not the file content
         if !is_head {

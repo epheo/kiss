@@ -229,8 +229,8 @@ cargo run --release
 cargo test bench_ -- --include-ignored --nocapture
 
 # Run specific throughput tests
-cargo test test_maximum_throughput -- --include-ignored
-cargo test test_sustained_capacity -- --include-ignored
+cargo test test_maximum_throughput -- --include-ignored --nocapture
+cargo test test_sustained_capacity -- --include-ignored --nocapture
 ```
 
 ### Performance Test Categories
