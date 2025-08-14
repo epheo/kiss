@@ -276,12 +276,24 @@ mod conditional_request_tests {
         }
         
         if let Some(modified_since_str) = if_modified_since {
-            if let Some(timestamp_str) = modified_since_str.strip_prefix("timestamp_") {
-                if let Ok(client_timestamp) = timestamp_str.parse::<u64>() {
-                    return Some(last_modified_timestamp <= client_timestamp);
+            // Use httpdate parsing like the real server implementation
+            match httpdate::parse_http_date(modified_since_str) {
+                Ok(client_time) => {
+                    // Convert timestamp to SystemTime for comparison
+                    let server_time = std::time::SystemTime::UNIX_EPOCH + 
+                        std::time::Duration::from_secs(last_modified_timestamp);
+                    return Some(server_time <= client_time);
+                }
+                Err(_) => {
+                    // Handle legacy timestamp_ format for backward compatibility in tests
+                    if let Some(timestamp_str) = modified_since_str.strip_prefix("timestamp_") {
+                        if let Ok(client_timestamp) = timestamp_str.parse::<u64>() {
+                            return Some(last_modified_timestamp <= client_timestamp);
+                        }
+                    }
+                    return Some(false);
                 }
             }
-            return Some(false);
         }
         
         None
@@ -345,8 +357,9 @@ mod conditional_request_tests {
 
     #[test]
     fn test_if_modified_since() {
-        let file_timestamp = 1000; // File modified at timestamp 1000
+        let file_timestamp = 1000; // File modified at timestamp 1000 (Jan 1, 1970 + 1000 seconds)
         
+        // Legacy timestamp format tests (for backward compatibility)
         // Client has older version (timestamp 500) - should return file
         assert_eq!(
             should_return_not_modified_test(Some("timestamp_500"), None, file_timestamp, ""),
@@ -366,6 +379,28 @@ mod conditional_request_tests {
             should_return_not_modified_test(Some("timestamp_1500"), None, file_timestamp, ""),
             Some(true),
             "Newer client timestamp should return 304"
+        );
+
+        // RFC-compliant HTTP-date format tests
+        // Test with older HTTP date - should return file
+        assert_eq!(
+            should_return_not_modified_test(Some("Mon, 01 Jan 1990 00:00:00 GMT"), None, 946684800, ""), // Year 2000
+            Some(false),
+            "Older HTTP date should return file"
+        );
+        
+        // Test with same HTTP date - should return 304
+        assert_eq!(
+            should_return_not_modified_test(Some("Sat, 01 Jan 2000 00:00:00 GMT"), None, 946684800, ""), // Exact match
+            Some(true),
+            "Same HTTP date should return 304"
+        );
+        
+        // Test with newer HTTP date - should return 304  
+        assert_eq!(
+            should_return_not_modified_test(Some("Mon, 01 Jan 2001 00:00:00 GMT"), None, 946684800, ""), // Year 2000 file, 2001 client
+            Some(true),
+            "Newer HTTP date should return 304"
         );
         
         // Malformed timestamp - should return file

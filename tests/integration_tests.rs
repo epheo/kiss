@@ -223,7 +223,12 @@ mod http_integration_tests {
             Ok(response) => {
                 assert!(response.contains("HTTP/1.1 200 OK"));
                 assert!(response.contains("ETag: W/"), "Response should contain weak ETag header");
-                assert!(response.contains("Last-Modified: timestamp_"), "Response should contain Last-Modified header");
+                assert!(response.contains("Last-Modified: "), "Response should contain Last-Modified header");
+                // Verify HTTP-date format (RFC 7231): "Day, DD Mon YYYY HH:MM:SS GMT"
+                let has_valid_http_date = response.contains("Mon, ") || response.contains("Tue, ") || 
+                    response.contains("Wed, ") || response.contains("Thu, ") || response.contains("Fri, ") || 
+                    response.contains("Sat, ") || response.contains("Sun, ");
+                assert!(has_valid_http_date, "Last-Modified should use RFC 7231 HTTP-date format");
                 assert!(response.contains("Cache-Control: public, max-age=3600"), "Response should contain cache control");
                 println!("✓ ETag and caching headers present in response");
             }
@@ -348,7 +353,8 @@ mod http_integration_tests {
             }
             
             // Test If-Modified-Since with older timestamp should return 200
-            match send_conditional_request("/index.html", Some("timestamp_0"), None) {
+            // Use a very old HTTP-date (January 1, 1990) to ensure it's older than any file
+            match send_conditional_request("/index.html", Some("Mon, 01 Jan 1990 00:00:00 GMT"), None) {
                 Ok(response) => {
                     assert!(response.contains("HTTP/1.1 200 OK"), 
                         "Older timestamp should return 200 OK, got: {}", response);

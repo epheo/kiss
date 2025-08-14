@@ -4,7 +4,11 @@
 
 This is a minimalistic **base image** for serving static files behind a Kubernetes ingress controller.
 
+KISS is a Rust highly specific web server serving a single purpose: "To serve static files built in container image in Kubernetes environment, rapidly"
+See following chapter and "Performance Architecture" ragarding its tradeoff.
+
 KISS provides a secure, lightweight foundation that users extend with their own static content. The server serves files from the container root directory (`/`) while protecting the server binary at `/kiss`.
+
 
 ## What KISS does NOT implement (By Design)
 
@@ -267,4 +271,43 @@ KISS is designed with security as a primary concern:
 - **Health Endpoints**: Separate `/health` and `/ready` endpoints for monitoring
 - **Worker Pool**: Bounded connection handling prevents resource exhaustion
 - **No File Writes**: Server only reads files, never modifies filesystem
+
+## Performance Architecture
+
+KISS uses a **startup file cache** system that pre-computes all file metadata and HTTP headers at server initialization, enabling zero-allocation request handling.
+
+### How It Works
+
+At startup, KISS recursively scans the static directory and builds an in-memory HashMap containing:
+- **Complete HTTP headers**: Pre-generated response headers including MIME types, content lengths, ETags, and security headers
+- **File paths**: Pre-computed absolute paths to eliminate runtime string building
+- **Metadata**: File sizes, modification times, and ETags for conditional request handling
+
+### Performance Benefits
+
+This approach delivers exceptional performance through:
+- **Zero Runtime Allocations**: Headers are pre-built, not generated per request
+- **O(1) File Lookups**: HashMap access instead of filesystem operations
+- **Eliminated String Building**: All paths and headers pre-computed at startup
+- **Memory Locality**: All file metadata loaded upfront for better cache performance
+
+### Security Advantages
+
+The startup cache provides additional security:
+- **Immutable File Set**: Only files present at startup can be served
+- **Directory Traversal Protection**: Cache lookups prevent access to files outside the initial scan
+- **Attack Surface Reduction**: No dynamic file system access during request handling
+
+### Container Optimization
+
+This design is optimized for the container use case:
+- **Immutable Infrastructure**: Perfect for containers where static files don't change after deployment
+- **Fast Container Startup**: File scanning happens once during initialization
+- **Predictable Memory Usage**: Memory footprint determined by static file count at build time
+
+### Trade-offs
+
+- **Memory Usage**: Scales with number of static files (minimal impact for typical websites)
+- **Dynamic Files**: New files added after startup require a container restart to be served
+- **Startup Time**: Initial file scanning adds minimal overhead during container start
 
