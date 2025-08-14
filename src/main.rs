@@ -19,12 +19,13 @@ const KEEPALIVE_TIMEOUT_SECS: u64 = 5;
 
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
-// Optimized file metadata - pre-stored MIME strings for zero request overhead
+// Optimized file metadata - pre-stored strings for zero request overhead
 #[derive(Clone)]
 struct FileMetadata {
-    mime_type_str: &'static str,  // Pre-stored for zero request overhead
+    mime_type_str: &'static str,     // Pre-stored for zero request overhead
     size: u64,
-    last_modified: SystemTime,
+    last_modified: SystemTime,       // Keep for conditional request logic
+    last_modified_str: String,       // Pre-formatted RFC-compliant HTTP date
     etag: String,
 }
 
@@ -62,7 +63,7 @@ impl HeaderTemplates {
         }
     }
     
-    // Fast header generation using template - much faster than format!() macro
+    // Fast header generation using template - uses pre-stored RFC-compliant dates
     fn generate_file_headers(&self, file_metadata: &FileMetadata) -> Vec<u8> {
         // Pre-allocate buffer with reasonable size estimate
         let mut headers = Vec::with_capacity(400);
@@ -73,7 +74,7 @@ impl HeaderTemplates {
         headers.extend_from_slice(b"\r\nContent-Length: ");
         headers.extend_from_slice(file_metadata.size.to_string().as_bytes());
         headers.extend_from_slice(b"\r\nLast-Modified: ");
-        headers.extend_from_slice(format_http_date(file_metadata.last_modified).as_bytes());
+        headers.extend_from_slice(file_metadata.last_modified_str.as_bytes()); // Pre-stored RFC-compliant date
         headers.extend_from_slice(b"\r\nETag: ");
         headers.extend_from_slice(file_metadata.etag.as_bytes());
         headers.extend_from_slice(b"\r\nCache-Control: public, max-age=3600\r\nX-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nContent-Security-Policy: default-src 'self'; style-src 'self' 'unsafe-inline' https:; script-src 'self' 'unsafe-inline' https:; img-src 'self' data: blob: https:; font-src 'self' data: https:; object-src 'self' data:; base-uri 'self'\r\nConnection: keep-alive\r\n\r\n");
@@ -319,22 +320,21 @@ fn generate_file_metadata(file_path: &std::path::Path, _relative_path: &str) -> 
     let mime_type_enum = get_mime_type_enum(file_path);
     let mime_type_str = mime_type_enum.as_str();
     
+    // Format HTTP date once during cache building - RFC 7231 compliant
+    let last_modified_str = format_http_date(last_modified);
+    
     Ok(FileMetadata {
         mime_type_str,
         size,
         last_modified,
+        last_modified_str,
         etag,
     })
 }
 
 fn format_http_date(time: SystemTime) -> String {
-    // Ultra-fast timestamp formatting optimized for file cache building
-    let timestamp = time.duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or(Duration::from_secs(0))
-        .as_secs();
-    
-    // Fastest approach: direct integer to string conversion
-    timestamp.to_string()
+    // RFC 7231 compliant HTTP-date formatting - done once during cache building
+    httpdate::fmt_http_date(time)
 }
 
 #[tokio::main]
@@ -521,11 +521,11 @@ async fn handle_request(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Handle health check endpoints with pre-compiled responses (optimized for performance)
     if path == "/health" {
-        return send_precompiled_health_response(stream, is_head).await;
+        return send_response(stream, &HEADER_TEMPLATES.health_response, is_head).await;
     }
 
     if path == "/ready" {
-        return send_precompiled_ready_response(stream, is_head).await;
+        return send_response(stream, &HEADER_TEMPLATES.ready_response, is_head).await;
     }
 
     serve_static_file(stream, path, is_head, if_modified_since, if_none_match).await
@@ -566,26 +566,31 @@ async fn serve_static_file(
 
         // Generate headers dynamically from optimized template
         let headers = HEADER_TEMPLATES.generate_file_headers(file_metadata);
+        
+        // Send headers first
         stream.write_all(&headers).await?;
 
         // For HEAD requests, only send headers, not the file content
         if !is_head {
-            // Open and stream the file content (zero-copy) - optimized path construction
-            let file_result = if lookup_path == "/index.html" {
-                File::open("./index.html").await
+            // Construct file path efficiently
+            let file_path = if lookup_path == "/index.html" {
+                "./index.html".to_string()
             } else {
-                // Use more efficient path construction
                 let mut path_buf = String::with_capacity(STATIC_DIR.len() + lookup_path.len());
                 path_buf.push_str(STATIC_DIR);
                 path_buf.push_str(&lookup_path);
-                File::open(path_buf).await
+                path_buf
             };
             
-            if let Ok(mut file) = file_result {
-                tokio::io::copy(&mut file, stream).await?;
-            } else {
-                // File disappeared since cache was built - should be rare
-                return send_precompiled_response(stream, &HEADER_TEMPLATES.not_found).await;
+            // Stream file content
+            match File::open(&file_path).await {
+                Ok(mut file) => {
+                    tokio::io::copy(&mut file, stream).await?;
+                }
+                Err(_) => {
+                    // File disappeared since cache was built - should be rare
+                    return send_precompiled_response(stream, &HEADER_TEMPLATES.not_found).await;
+                }
             }
         }
         stream.flush().await?;
@@ -639,73 +644,61 @@ fn strip_etag_wrapper(etag: &str) -> &str {
         .trim_matches('"')
 }
 
-// Optimized timestamp comparison for If-Modified-Since
+// RFC-compliant HTTP date comparison for If-Modified-Since
 fn is_not_modified_since(modified_since_str: &str, last_modified: &SystemTime) -> bool {
-    // Fast path for our simple timestamp format
-    if let Some(timestamp_str) = modified_since_str.strip_prefix("timestamp_") {
-        if let Ok(client_timestamp) = timestamp_str.parse::<u64>() {
-            let our_timestamp = last_modified
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap_or(Duration::from_secs(0))
-                .as_secs();
-            return our_timestamp <= client_timestamp;
+    // Parse the HTTP date from client's If-Modified-Since header
+    match httpdate::parse_http_date(modified_since_str) {
+        Ok(client_time) => {
+            // Return true (304 Not Modified) if our file is not newer than client's cached version
+            // Use <= because HTTP dates have 1-second resolution
+            last_modified <= &client_time
+        }
+        Err(_) => {
+            // Invalid date format - be conservative and assume file was modified
+            false
         }
     }
-    
-    // For proper HTTP date parsing, we'd need a more complex implementation
-    // For now, be conservative and assume file was modified
-    false
 }
 
-async fn send_not_modified_response(
+// Unified response handler that supports all response types
+async fn send_response(
     stream: &mut TcpStream,
+    response_data: &[u8],
+    is_head: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let response = b"HTTP/1.1 304 Not Modified\r\nCache-Control: public, max-age=3600\r\nConnection: keep-alive\r\n\r\n";
-    stream.write_all(response).await?;
+    if is_head {
+        // For HEAD requests, extract and send only headers
+        let header_end = response_data.windows(4).position(|w| w == b"\r\n\r\n")
+            .map(|pos| pos + 4)
+            .unwrap_or(response_data.len());
+        stream.write_all(&response_data[..header_end]).await?;
+    } else {
+        // For GET requests, send the full response
+        stream.write_all(response_data).await?;
+    }
     stream.flush().await?;
     Ok(())
 }
 
-// Optimized function for pre-compiled responses
+// Convenience function for simple precompiled responses (GET only)
 async fn send_precompiled_response(
     stream: &mut TcpStream,
     response: &[u8],
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    send_response(stream, response, false).await
+}
+
+// 304 Not Modified response - headers only, no body
+async fn send_not_modified_response(
+    stream: &mut TcpStream,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let response = b"HTTP/1.1 304 Not Modified\r\nCache-Control: public, max-age=3600\r\nConnection: keep-alive\r\n\r\n";
+    // 304 responses never have a body, regardless of request method
     stream.write_all(response).await?;
     stream.flush().await?;
     Ok(())
 }
 
-async fn send_precompiled_health_response(stream: &mut TcpStream, is_head: bool) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    if is_head {
-        // For HEAD requests, send only headers (extract from pre-compiled response)
-        let response = &HEADER_TEMPLATES.health_response;
-        let header_end = response.windows(4).position(|w| w == b"\r\n\r\n")
-            .map(|pos| pos + 4)
-            .unwrap_or(response.len());
-        stream.write_all(&response[..header_end]).await?;
-    } else {
-        // For GET requests, send the full pre-compiled response
-        stream.write_all(&HEADER_TEMPLATES.health_response).await?;
-    }
-    stream.flush().await?;
-    Ok(())
-}
 
-async fn send_precompiled_ready_response(stream: &mut TcpStream, is_head: bool) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    if is_head {
-        // For HEAD requests, send only headers (extract from pre-compiled response)
-        let response = &HEADER_TEMPLATES.ready_response;
-        let header_end = response.windows(4).position(|w| w == b"\r\n\r\n")
-            .map(|pos| pos + 4)
-            .unwrap_or(response.len());
-        stream.write_all(&response[..header_end]).await?;
-    } else {
-        // For GET requests, send the full pre-compiled response
-        stream.write_all(&HEADER_TEMPLATES.ready_response).await?;
-    }
-    stream.flush().await?;
-    Ok(())
-}
 
 
