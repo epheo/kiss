@@ -19,14 +19,14 @@ const KEEPALIVE_TIMEOUT_SECS: u64 = 5;
 
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
-// Optimized file metadata - pre-stored strings for zero request overhead
+// Optimized file metadata - pre-computed headers and paths for zero request overhead
 #[derive(Clone)]
 struct FileMetadata {
-    mime_type_str: &'static str,     // Pre-stored for zero request overhead
-    size: u64,
+    headers: Vec<u8>,                // Pre-generated complete HTTP headers (biggest win)
+    file_path: String,               // Pre-computed file path (eliminates string building)
+    size: u64,                       // Keep for conditional logic and file size limits
     last_modified: SystemTime,       // Keep for conditional request logic
-    last_modified_str: String,       // Pre-formatted RFC-compliant HTTP date
-    etag: String,
+    etag: String,                    // Keep for conditional logic
 }
 
 // Pre-compiled header templates for fast response generation
@@ -63,24 +63,6 @@ impl HeaderTemplates {
         }
     }
     
-    // Fast header generation using template - uses pre-stored RFC-compliant dates
-    fn generate_file_headers(&self, file_metadata: &FileMetadata) -> Vec<u8> {
-        // Pre-allocate buffer with reasonable size estimate
-        let mut headers = Vec::with_capacity(400);
-        
-        // Optimized header generation with minimal allocations
-        headers.extend_from_slice(b"HTTP/1.1 200 OK\r\nContent-Type: ");
-        headers.extend_from_slice(file_metadata.mime_type_str.as_bytes());
-        headers.extend_from_slice(b"\r\nContent-Length: ");
-        headers.extend_from_slice(file_metadata.size.to_string().as_bytes());
-        headers.extend_from_slice(b"\r\nLast-Modified: ");
-        headers.extend_from_slice(file_metadata.last_modified_str.as_bytes()); // Pre-stored RFC-compliant date
-        headers.extend_from_slice(b"\r\nETag: ");
-        headers.extend_from_slice(file_metadata.etag.as_bytes());
-        headers.extend_from_slice(b"\r\nCache-Control: public, max-age=3600\r\nX-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nContent-Security-Policy: default-src 'self'; style-src 'self' 'unsafe-inline' https:; script-src 'self' 'unsafe-inline' https:; img-src 'self' data: blob: https:; font-src 'self' data: https:; object-src 'self' data:; base-uri 'self'\r\nConnection: keep-alive\r\n\r\n");
-        
-        headers
-    }
     
     fn create_health_response() -> Vec<u8> {
         let health_status = r#"{"status":"healthy","timestamp":"0"}"#;
@@ -304,30 +286,47 @@ fn discover_files_recursive(
     Ok(())
 }
 
-fn generate_file_metadata(file_path: &std::path::Path, _relative_path: &str) -> Result<FileMetadata, Box<dyn std::error::Error>> {
+fn generate_file_metadata(file_path: &std::path::Path, relative_path: &str) -> Result<FileMetadata, Box<dyn std::error::Error>> {
     let metadata = fs::metadata(file_path)?;
     let size = metadata.len();
     let last_modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
     
-    // Generate weak ETag using size and modification time - optimized integer formatting
+    // Generate weak ETag using size and modification time
     let mtime_secs = last_modified
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or(Duration::from_secs(0))
         .as_secs();
     let etag = format!("W/\"{}-{}\"", size, mtime_secs);
     
-    // Get MIME type using fast enum lookup during cache building, store as static string
+    // Get MIME type using fast enum lookup during cache building
     let mime_type_enum = get_mime_type_enum(file_path);
     let mime_type_str = mime_type_enum.as_str();
     
     // Format HTTP date once during cache building - RFC 7231 compliant
     let last_modified_str = format_http_date(last_modified);
     
+    // Pre-generate complete HTTP headers - eliminates all runtime allocations
+    let headers = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\nLast-Modified: {}\r\nETag: {}\r\nCache-Control: public, max-age=3600\r\nX-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nContent-Security-Policy: default-src 'self'; style-src 'self' 'unsafe-inline' https:; script-src 'self' 'unsafe-inline' https:; img-src 'self' data: blob: https:; font-src 'self' data: https:; object-src 'self' data:; base-uri 'self'\r\nConnection: keep-alive\r\n\r\n",
+        mime_type_str, size, last_modified_str, etag
+    ).into_bytes();
+    
+    // Pre-compute file path - eliminates runtime string building
+    let full_file_path = if relative_path == "index.html" {
+        "./index.html".to_string()
+    } else {
+        let mut path_buf = String::with_capacity(STATIC_DIR.len() + relative_path.len() + 1);
+        path_buf.push_str(STATIC_DIR);
+        path_buf.push('/');
+        path_buf.push_str(relative_path);
+        path_buf
+    };
+    
     Ok(FileMetadata {
-        mime_type_str,
+        headers,
+        file_path: full_file_path,
         size,
         last_modified,
-        last_modified_str,
         etag,
     })
 }
@@ -564,26 +563,13 @@ async fn serve_static_file(
             }
         }
 
-        // Generate headers dynamically from optimized template
-        let headers = HEADER_TEMPLATES.generate_file_headers(file_metadata);
-        
-        // Send headers first
-        stream.write_all(&headers).await?;
+        // Send pre-generated headers - zero allocations!
+        stream.write_all(&file_metadata.headers).await?;
 
         // For HEAD requests, only send headers, not the file content
         if !is_head {
-            // Construct file path efficiently
-            let file_path = if lookup_path == "/index.html" {
-                "./index.html".to_string()
-            } else {
-                let mut path_buf = String::with_capacity(STATIC_DIR.len() + lookup_path.len());
-                path_buf.push_str(STATIC_DIR);
-                path_buf.push_str(&lookup_path);
-                path_buf
-            };
-            
-            // Stream file content
-            match File::open(&file_path).await {
+            // Use pre-computed file path - zero string building!
+            match File::open(&file_metadata.file_path).await {
                 Ok(mut file) => {
                     tokio::io::copy(&mut file, stream).await?;
                 }
