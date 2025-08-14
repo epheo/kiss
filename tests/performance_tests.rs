@@ -303,39 +303,6 @@ mod performance_regression_tests {
         println!("✅ Maximum throughput test passed: {:.0} req/s", max_rps);
     }
     
-    #[test]
-    #[ignore] // Performance test - run manually
-    fn test_path_sanitization_performance() {
-        let test_paths = [
-            "/simple.html",
-            "/path/to/file.css", 
-            "/complex/../../../path/./file.js",
-            &format!("/{}/file.html", "long-component".repeat(10)),
-            &format!("/{}", "../".repeat(100)),
-        ];
-        
-        const ITERATIONS: usize = 10000;
-        
-        for path in &test_paths {
-            let start = Instant::now();
-            
-            for _ in 0..ITERATIONS {
-                let _result = kiss::sanitize_path(path);
-            }
-            
-            let duration = start.elapsed();
-            let ops_per_sec = ITERATIONS as f64 / duration.as_secs_f64();
-            
-            println!("Path sanitization performance for {:?}:", 
-                    if path.len() > 50 { format!("{}...", &path[..47]) } else { path.to_string() });
-            println!("  {} iterations in {:?} ({:.0} ops/sec)", 
-                    ITERATIONS, duration, ops_per_sec);
-            
-            // Should be very fast for path sanitization
-            assert!(ops_per_sec > 10000.0, 
-                   "Path sanitization too slow: {:.0} ops/sec for {:?}", ops_per_sec, path);
-        }
-    }
     
     #[test]
     #[ignore] // Performance test - run manually
@@ -430,57 +397,7 @@ mod performance_regression_tests {
 mod benchmark_tests {
     use super::*;
     
-    #[test]
-    fn bench_path_sanitization_simple() {
-        // Benchmark simple paths (most common case)
-        let simple_paths = ["/index.html", "/style.css", "/js/app.js"];
-        const ITERATIONS: usize = 100000;
-        
-        let start = Instant::now();
-        for _ in 0..ITERATIONS {
-            for path in &simple_paths {
-                let _result = kiss::sanitize_path(path);
-            }
-        }
-        let duration = start.elapsed();
-        
-        let total_ops = ITERATIONS * simple_paths.len();
-        let ops_per_sec = total_ops as f64 / duration.as_secs_f64();
-        
-        println!("Simple path sanitization: {} ops in {:?} ({:.0} ops/sec)", 
-                total_ops, duration, ops_per_sec);
-        
-        // Should be extremely fast for simple paths
-        assert!(ops_per_sec > 100000.0, "Simple path sanitization should be >100k ops/sec");
-    }
     
-    #[test] 
-    fn bench_path_sanitization_complex() {
-        // Benchmark complex paths with traversal (security-critical case)
-        let complex_paths = [
-            "/css/../js/../../etc/passwd",
-            "/../../../etc/shadow", 
-            "/a/b/c/../../../../kiss",
-        ];
-        const ITERATIONS: usize = 10000;
-        
-        let start = Instant::now();
-        for _ in 0..ITERATIONS {
-            for path in &complex_paths {
-                let _result = kiss::sanitize_path(path);
-            }
-        }
-        let duration = start.elapsed();
-        
-        let total_ops = ITERATIONS * complex_paths.len();
-        let ops_per_sec = total_ops as f64 / duration.as_secs_f64();
-        
-        println!("Complex path sanitization: {} ops in {:?} ({:.0} ops/sec)", 
-                total_ops, duration, ops_per_sec);
-        
-        // Should still be fast even for complex paths
-        assert!(ops_per_sec > 10000.0, "Complex path sanitization should be >10k ops/sec");
-    }
     
     #[test]
     fn bench_mime_type_detection() {

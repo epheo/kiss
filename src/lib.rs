@@ -50,50 +50,6 @@ impl MimeType {
     }
 }
 
-pub fn sanitize_path(path: &str) -> String {
-    // Remove query parameters and fragments
-    let path = path.split('?').next().unwrap_or(path);
-    let path = path.split('#').next().unwrap_or(path);
-    
-    // Normalize the path to resolve . and .. components
-    // This simulates path resolution to prevent directory traversal
-    let mut stack = Vec::new();
-    
-    // Ensure path starts with / for consistent processing
-    let normalized_input = if path.starts_with('/') {
-        path.to_string()
-    } else {
-        format!("/{}", path)
-    };
-    
-    // Split path and process each component
-    for part in normalized_input.split('/') {
-        if part.is_empty() || part == "." {
-            // Skip empty parts and current directory references
-            continue;
-        } else if part == ".." {
-            // Parent directory - pop from stack if possible
-            stack.pop();
-        } else {
-            // Normal component - add to stack
-            stack.push(part);
-        }
-    }
-    
-    // Build the normalized path
-    let normalized_path = if stack.is_empty() {
-        "/".to_string()
-    } else {
-        format!("/{}", stack.join("/"))
-    };
-    
-    // Block access to the kiss binary specifically  
-    if normalized_path == "/kiss" {
-        "/".to_string() // Return root path to trigger 404
-    } else {
-        normalized_path
-    }
-}
 
 // Fast MIME type detection - optimized internal implementation
 pub fn get_mime_type_enum(file_path: &Path) -> MimeType {

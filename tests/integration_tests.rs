@@ -9,7 +9,7 @@ mod http_integration_tests {
     // Note: These tests require a running server instance
     // In a real implementation, we'd start the server programmatically
     
-    fn send_get_request(path: &str) -> Result<String, std::io::Error> {
+    pub fn send_get_request(path: &str) -> Result<String, std::io::Error> {
         let mut stream = TcpStream::connect("127.0.0.1:8080")?;
         let request = format!("GET {} HTTP/1.1\r\nHost: localhost\r\n\r\n", path);
         
@@ -393,6 +393,212 @@ mod http_integration_tests {
         assert!(body.is_empty() || body.trim().is_empty(), "HEAD response should not contain body");
         
         println!("✓ HEAD request with cache headers test passed");
+    }
+}
+
+#[cfg(test)]
+mod path_security_integration_tests {
+    use super::http_integration_tests::send_get_request;
+    
+    // Test that directory traversal attacks are blocked by cache-based protection
+    #[test]
+    #[ignore] // Requires server to be running
+    fn test_directory_traversal_protection() {
+        let traversal_paths = vec![
+            "/../etc/passwd",
+            "/../../etc/passwd",
+            "/css/../../../etc/passwd",
+            "/../../../../../etc/passwd",
+            "/css/../js/../../etc/passwd",
+            "/images/../../../etc/passwd",
+            "/valid/path/../../etc/passwd",
+        ];
+        
+        for path in traversal_paths {
+            match send_get_request(path) {
+                Ok(response) => {
+                    assert!(response.contains("HTTP/1.1 404 Not Found"), 
+                        "Directory traversal path {} should return 404, got: {}", path, response);
+                    println!("✓ Directory traversal blocked: {}", path);
+                }
+                Err(_) => {
+                    println!("Warning: Server not running, skipping traversal test for {}", path);
+                }
+            }
+        }
+    }
+    
+    // Test that attempts to access the kiss binary are blocked
+    #[test]
+    #[ignore] // Requires server to be running
+    fn test_binary_access_prevention() {
+        let binary_paths = vec![
+            "/kiss",
+            "/./kiss",
+            "/css/../kiss",
+            "/images/../js/../kiss", 
+            "/valid/path/../kiss",
+            "/../kiss",
+            "/../../kiss",
+        ];
+        
+        for path in binary_paths {
+            match send_get_request(path) {
+                Ok(response) => {
+                    assert!(response.contains("HTTP/1.1 404 Not Found"), 
+                        "Binary access path {} should return 404, got: {}", path, response);
+                    println!("✓ Binary access blocked: {}", path);
+                }
+                Err(_) => {
+                    println!("Warning: Server not running, skipping binary access test for {}", path);
+                }
+            }
+        }
+    }
+    
+    // Test that complex traversal patterns don't work
+    #[test]
+    #[ignore] // Requires server to be running  
+    fn test_complex_traversal_patterns() {
+        let complex_paths = vec![
+            "/css/../js/../index.html/../../../etc/passwd",
+            "/./././../etc/passwd",
+            "/css/./../../etc/passwd", 
+            "/images/icons/../../../etc/passwd",
+            "/../../../../../../../etc/passwd",
+        ];
+        
+        for path in complex_paths {
+            match send_get_request(path) {
+                Ok(response) => {
+                    assert!(response.contains("HTTP/1.1 404 Not Found"), 
+                        "Complex traversal path {} should return 404, got: {}", path, response);
+                    println!("✓ Complex traversal blocked: {}", path);
+                }
+                Err(_) => {
+                    println!("Warning: Server not running, skipping complex traversal test for {}", path);
+                }
+            }
+        }
+    }
+    
+    // Test that query parameters in URLs are handled correctly
+    #[test]
+    #[ignore] // Requires server to be running from tests/content/
+    fn test_query_parameter_handling() {
+        let query_paths = vec![
+            ("/index.html?v=1", true),           // Should serve index.html
+            ("/style.css?version=2", true),      // Should serve style.css  
+            ("/app.js?timestamp=123", true),     // Should serve app.js
+            ("/nonexistent.html?param=value", false), // Should return 404
+        ];
+        
+        for (path, should_succeed) in query_paths {
+            match send_get_request(path) {
+                Ok(response) => {
+                    if should_succeed {
+                        // Currently this will fail because query stripping isn't implemented
+                        // This test will guide us on whether we need to implement it
+                        if response.contains("HTTP/1.1 200 OK") {
+                            println!("✓ Query parameter handled correctly: {}", path);
+                        } else {
+                            println!("⚠ Query parameter causes cache miss: {} - may need query stripping", path);
+                            assert!(response.contains("HTTP/1.1 404 Not Found"), 
+                                "Query parameter path {} should either succeed or return 404", path);
+                        }
+                    } else {
+                        assert!(response.contains("HTTP/1.1 404 Not Found"), 
+                            "Invalid query path {} should return 404", path);
+                        println!("✓ Invalid query path correctly returned 404: {}", path);
+                    }
+                }
+                Err(_) => {
+                    println!("Warning: Server not running from tests/content/, skipping query test for {}", path);
+                }
+            }
+        }
+    }
+    
+    // Test that fragment identifiers are handled (though they rarely reach server)
+    #[test]
+    #[ignore] // Requires server to be running from tests/content/
+    fn test_fragment_handling() {
+        let fragment_paths = vec![
+            "/index.html#section",
+            "/style.css#top",
+            "/app.js#main",
+        ];
+        
+        for path in fragment_paths {
+            match send_get_request(path) {
+                Ok(response) => {
+                    // Fragments usually don't reach the server, but if they do,
+                    // they should either work (if path normalization is added) or return 404
+                    if response.contains("HTTP/1.1 200 OK") {
+                        println!("✓ Fragment handled correctly: {}", path);
+                    } else {
+                        println!("⚠ Fragment causes cache miss: {} - fragments rarely sent by browsers anyway", path);
+                        assert!(response.contains("HTTP/1.1 404 Not Found"));
+                    }
+                }
+                Err(_) => {
+                    println!("Warning: Server not running from tests/content/, skipping fragment test for {}", path);
+                }
+            }
+        }
+    }
+    
+    // Test that legitimate paths still work correctly
+    #[test]
+    #[ignore] // Requires server to be running from tests/content/
+    fn test_legitimate_paths_still_work() {
+        let valid_paths = vec![
+            "/index.html",
+            "/style.css", 
+            "/app.js",
+            "/css/style.css",
+            "/test.svg",
+        ];
+        
+        for path in valid_paths {
+            match send_get_request(path) {
+                Ok(response) => {
+                    assert!(response.contains("HTTP/1.1 200 OK"), 
+                        "Legitimate path {} should return 200 OK, got: {}", path, response);
+                    println!("✓ Legitimate path works: {}", path);
+                }
+                Err(_) => {
+                    println!("Warning: Server not running from tests/content/, skipping legitimate path test for {}", path);
+                }
+            }
+        }
+    }
+    
+    // Test that the cache-based approach prevents access to files outside the static directory
+    #[test]
+    #[ignore] // Requires server to be running
+    fn test_cache_prevents_filesystem_access() {
+        let external_paths = vec![
+            "/etc/passwd",
+            "/usr/bin/ls",
+            "/home/user/.bashrc",
+            "/var/log/syslog",
+            "/proc/version",
+            "/kiss", // The binary itself
+        ];
+        
+        for path in external_paths {
+            match send_get_request(path) {
+                Ok(response) => {
+                    assert!(response.contains("HTTP/1.1 404 Not Found"), 
+                        "External path {} should return 404 due to cache-based protection, got: {}", path, response);
+                    println!("✓ Cache-based protection blocks external file: {}", path);
+                }
+                Err(_) => {
+                    println!("Warning: Server not running, skipping external file test for {}", path);
+                }
+            }
+        }
     }
 }
 

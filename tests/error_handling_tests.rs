@@ -7,22 +7,6 @@ use std::time::Duration;
 mod file_system_error_tests {
     use super::*;
     
-    #[test]
-    fn test_nonexistent_file_handling() {
-        // Test various non-existent file scenarios
-        let test_paths = [
-            "/nonexistent.html",
-            "/missing/file.css",
-            "/deep/nested/missing/file.js",
-            "/file-with-special-chars-!@#$.txt",
-        ];
-        
-        for path in &test_paths {
-            let sanitized = sanitize_path(path);
-            // Path sanitization should work even for non-existent files
-            assert!(sanitized.starts_with('/'), "Sanitized path should start with /: {}", sanitized);
-        }
-    }
     
     #[test]
     fn test_mime_type_for_nonexistent_files() {
@@ -42,23 +26,6 @@ mod file_system_error_tests {
         }
     }
     
-    #[test]
-    fn test_path_with_invalid_unicode() {
-        // Test paths with various challenging characters
-        let challenging_paths = [
-            "/файл.html", // Cyrillic
-            "/文件.css",   // Chinese
-            "/ファイル.js", // Japanese
-            "/🚀.html",    // Emoji
-            "/file%20with%20spaces.txt", // URL encoded
-        ];
-        
-        for path in &challenging_paths {
-            let result = sanitize_path(path);
-            // Should handle gracefully without panicking
-            assert!(result.starts_with('/'), "Should handle unicode path: {}", path);
-        }
-    }
     
     #[test]
     #[ignore] // Requires server to be running
@@ -195,36 +162,7 @@ mod connection_error_tests {
 mod resource_exhaustion_tests {
     use super::*;
     
-    #[test]
-    fn test_extremely_long_paths() {
-        // Test path sanitization with very long paths
-        let very_long_component = "a".repeat(1000);
-        let long_paths = [
-            format!("/{}", very_long_component),
-            format!("/{}/{}", very_long_component, very_long_component),
-            format!("/normal/../{}", very_long_component),
-        ];
-        
-        for path in &long_paths {
-            let result = sanitize_path(path);
-            // Should handle without panic or excessive memory usage
-            assert!(result.starts_with('/'), "Should handle very long path without panic");
-            // Result should be reasonable length (not exponentially longer)
-            assert!(result.len() < path.len() * 2, "Sanitized path should not explode in size");
-        }
-    }
     
-    #[test]
-    fn test_deeply_nested_traversal() {
-        // Test path with many ../.. components trying to access root-only file
-        let parts: Vec<String> = (0..1000).map(|_| "..".to_string()).collect();
-        let deep_traversal = format!("/{}", parts.join("/"));
-        
-        let result = sanitize_path(&deep_traversal);
-        
-        // Should resolve to root without infinite loop or stack overflow
-        assert_eq!(result, "/", "Deep traversal should resolve to root");
-    }
     
     #[test]
     fn test_mime_type_with_very_long_extension() {
@@ -288,21 +226,6 @@ mod resource_exhaustion_tests {
 mod error_recovery_tests {
     use super::*;
     
-    #[test]
-    fn test_sanitization_with_null_bytes() {
-        // Test paths with null bytes (should be handled gracefully)
-        let paths_with_nulls = [
-            "/file\0.html",
-            "/path\0/file.css", 
-            "\0/file.js",
-        ];
-        
-        for path in &paths_with_nulls {
-            let result = sanitize_path(path);
-            // Should handle without panic
-            assert!(result.starts_with('/'), "Should handle null bytes without panic: {:?}", path);
-        }
-    }
     
     #[test]
     fn test_edge_case_mime_types() {
@@ -326,25 +249,4 @@ mod error_recovery_tests {
         }
     }
     
-    #[test]
-    fn test_path_components_with_special_chars() {
-        // Test path sanitization with various special characters
-        let special_paths = [
-            "/file with spaces.html",
-            "/file-with-dashes.css",
-            "/file_with_underscores.js",
-            "/file+with+plus.txt",
-            "/file=with=equals.html",
-            "/file&with&ampersand.css",
-            "/file@with@at.js",
-        ];
-        
-        for path in &special_paths {
-            let result = sanitize_path(path);
-            // Should preserve valid special characters
-            assert!(result.starts_with('/'), "Should handle special chars: {}", path);
-            // Should not be empty
-            assert!(result.len() > 1, "Sanitized path should not be just root: {}", path);
-        }
-    }
 }

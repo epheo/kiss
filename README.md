@@ -4,13 +4,13 @@
 
 This is a minimalistic **base image** for serving static files behind a Kubernetes ingress controller.
 
-KISS is a Rust highly specific web server serving a single purpose: "To serve static files built in container image in Kubernetes environment, rapidly"
-See following chapter and "Performance Architecture" ragarding its tradeoff.
+KISS is a Rust based highly specific web server serving a single purpose: "To serve static files built in a container image in a Kubernetes environment, fast".
+See following chapter and "Performance Architecture" ragarding its trade-offs.
 
 KISS provides a secure, lightweight foundation that users extend with their own static content. The server serves files from the container root directory (`/`) while protecting the server binary at `/kiss`.
 
 
-## What KISS does NOT implement (By Design)
+## What KISS does NOT implement (by design)
 
 The following features are deliberately omitted from KISS because they are handled by the Kubernetes ingress controller:
 

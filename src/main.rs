@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::fs;
+use std::fs::{read_dir, metadata};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::SystemTime;
 use tokio::fs::File;
@@ -8,7 +8,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::signal;
 use tokio::time::{timeout, Duration};
 use once_cell::sync::OnceCell;
-use kiss::{get_mime_type_enum, sanitize_path};
+use kiss::get_mime_type_enum;
 
 const PORT: u16 = 8080;
 const MAX_REQUEST_SIZE: usize = 8192;
@@ -36,7 +36,6 @@ static FILE_CACHE: OnceCell<HashMap<String, FileMetadata>> = OnceCell::new();
 // Pre-compiled response header templates
 #[derive(Debug)]
 struct HeaderTemplates {
-    _ok_template: String,
     not_found: Vec<u8>,
     method_not_allowed: Vec<u8>,
     request_too_large: Vec<u8>,
@@ -50,7 +49,6 @@ struct HeaderTemplates {
 impl HeaderTemplates {
     fn new() -> Self {
         Self {
-            _ok_template: "HTTP/1.1 200 OK\r\nContent-Type: {mime_type}\r\nContent-Length: {content_length}\r\nCache-Control: public, max-age=3600\r\nX-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nContent-Security-Policy: default-src 'self'; style-src 'self' 'unsafe-inline' https:; script-src 'self' 'unsafe-inline' https:; img-src 'self' data: blob: https:; font-src 'self' data: https:; object-src 'self' data:; base-uri 'self'\r\nConnection: keep-alive\r\n\r\n".to_string(),
             not_found: b"HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nContent-Length: 14\r\nX-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nContent-Security-Policy: default-src 'self'; style-src 'self' 'unsafe-inline' https:; script-src 'self' 'unsafe-inline' https:; img-src 'self' data: blob: https:; font-src 'self' data: https:; object-src 'self' data:; base-uri 'self'\r\nConnection: keep-alive\r\n\r\nFile not found".to_vec(),
             method_not_allowed: b"HTTP/1.1 405 Method Not Allowed\r\nContent-Type: text/plain\r\nContent-Length: 18\r\nX-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nContent-Security-Policy: default-src 'self'; style-src 'self' 'unsafe-inline' https:; script-src 'self' 'unsafe-inline' https:; img-src 'self' data: blob: https:; font-src 'self' data: https:; object-src 'self' data:; base-uri 'self'\r\nConnection: keep-alive\r\n\r\nMethod not allowed".to_vec(),
             request_too_large: b"HTTP/1.1 413 Request Entity Too Large\r\nContent-Type: text/plain\r\nContent-Length: 17\r\nX-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nContent-Security-Policy: default-src 'self'; style-src 'self' 'unsafe-inline' https:; script-src 'self' 'unsafe-inline' https:; img-src 'self' data: blob: https:; font-src 'self' data: https:; object-src 'self' data:; base-uri 'self'\r\nConnection: keep-alive\r\n\r\nRequest too large".to_vec(),
@@ -246,7 +244,7 @@ fn discover_files_recursive(
         full_path.push_str(relative_path);
     }
     
-    let entries = fs::read_dir(&full_path)?;
+    let entries = read_dir(&full_path)?;
     
     for entry in entries {
         let entry = entry?;
@@ -286,9 +284,11 @@ fn discover_files_recursive(
 }
 
 fn generate_file_metadata(file_path: &std::path::Path, relative_path: &str) -> Result<FileMetadata, Box<dyn std::error::Error>> {
-    let metadata = fs::metadata(file_path)?;
-    let size = metadata.len();
-    let last_modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+    let file_metadata = metadata(file_path)?;
+    let size = file_metadata.len();
+    let last_modified_raw = file_metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+    // Truncate to second precision during cache building for HTTP compliance
+    let last_modified = truncate_to_seconds(&last_modified_raw);
     
     // Generate weak ETag using size and modification time
     let mtime_secs = last_modified
@@ -368,10 +368,6 @@ async fn main() {
                 SHUTDOWN.store(true, Ordering::Relaxed);
                 break;
             }
-        }
-
-        if SHUTDOWN.load(Ordering::Relaxed) {
-            break;
         }
     }
 
@@ -544,15 +540,20 @@ async fn serve_static_file(
     if_modified_since: Option<&str>,
     if_none_match: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let sanitized_path = sanitize_path(path);
-    let lookup_path = if sanitized_path == "/" {
-        "/index.html".to_string()
-    } else {
-        sanitized_path
-    };
+    // Strip query parameters for cache lookup (zero allocation)
+    let clean_path = path.split('?').next().unwrap_or(path);
+    
+    // Smart lookup: try direct path first, then index.html for root
+    let file_cache = FILE_CACHE.get().unwrap();
+    let file_metadata = file_cache.get(clean_path)
+        .or_else(|| if clean_path == "/" { 
+            file_cache.get("/index.html") 
+        } else { 
+            None 
+        });
 
     // Try to get file metadata from cache
-    if let Some(file_metadata) = FILE_CACHE.get().unwrap().get(&lookup_path) {
+    if let Some(file_metadata) = file_metadata {
         // Check file size limit (already validated during cache build, but double-check)
         if file_metadata.size > MAX_FILE_SIZE {
             return send_precompiled_response(stream, &HEADER_TEMPLATES.get().unwrap().file_too_large).await;
@@ -637,6 +638,14 @@ fn strip_etag_wrapper(etag: &str) -> &str {
         .trim_matches('"')
 }
 
+// Helper to truncate SystemTime to second precision for HTTP date comparison
+fn truncate_to_seconds(time: &SystemTime) -> SystemTime {
+    let duration_since_epoch = time.duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_else(|_| std::time::Duration::from_secs(0));
+    let seconds_only = std::time::Duration::from_secs(duration_since_epoch.as_secs());
+    SystemTime::UNIX_EPOCH + seconds_only
+}
+
 // RFC-compliant HTTP date comparison for If-Modified-Since
 fn is_not_modified_since(modified_since_str: &str, last_modified: &SystemTime) -> bool {
     // Parse the HTTP date from client's If-Modified-Since header
@@ -644,7 +653,8 @@ fn is_not_modified_since(modified_since_str: &str, last_modified: &SystemTime) -
         Ok(client_time) => {
             // Return true (304 Not Modified) if our file is not newer than client's cached version
             // Use <= because HTTP dates have 1-second resolution
-            last_modified <= &client_time
+            // Note: last_modified is already truncated to second precision during cache building
+            *last_modified <= client_time
         }
         Err(_) => {
             // Invalid date format - be conservative and assume file was modified
