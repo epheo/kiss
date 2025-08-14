@@ -199,10 +199,12 @@ mod http_response_validation_tests {
     fn test_security_headers_presence() {
         match send_raw_request("GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n") {
             Ok(response) => {
-                // Verify all security headers are present
-                assert!(response.contains("X-Frame-Options: DENY"), "Missing X-Frame-Options");
+                // Verify essential security headers are present for static cache server
                 assert!(response.contains("X-Content-Type-Options: nosniff"), "Missing X-Content-Type-Options");
-                assert!(response.contains("Content-Security-Policy:"), "Missing CSP");
+                
+                // Should NOT contain CSP or X-Frame-Options (minimal approach for static cache server)
+                assert!(!response.contains("X-Frame-Options:"), "X-Frame-Options should not be present");
+                assert!(!response.contains("Content-Security-Policy:"), "CSP should not be present");
             }
             Err(_) => {
                 println!("Warning: Server not running, skipping security headers test");

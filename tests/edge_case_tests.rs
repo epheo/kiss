@@ -57,8 +57,8 @@ mod cache_edge_case_tests {
                         "Cache miss for {} should return 404, got: {}", file_path, response);
                     assert!(response.contains("File not found"), 
                         "404 response should contain error message");
-                    assert!(response.contains("X-Frame-Options: DENY"), 
-                        "404 response should include security headers");
+                    assert!(response.contains("X-Content-Type-Options: nosniff"), 
+                        "404 response should include essential security headers");
                     
                     println!("✓ Cache miss handled correctly for {}", file_path);
                 }

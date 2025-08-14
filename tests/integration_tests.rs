@@ -89,12 +89,13 @@ mod http_integration_tests {
     #[test]
     #[ignore] // Requires server to be running
     fn test_security_headers_on_cached_files() {
-        // Test that security headers are present on cached file responses
+        // Test that essential security headers are present on cached file responses
         match send_get_request("/index.html") {
             Ok(response) => {
-                assert!(response.contains("X-Frame-Options: DENY"));
                 assert!(response.contains("X-Content-Type-Options: nosniff"));
-                assert!(response.contains("Content-Security-Policy:"));
+                // Minimal headers approach - no CSP or X-Frame-Options for static cache server
+                assert!(!response.contains("X-Frame-Options:"));
+                assert!(!response.contains("Content-Security-Policy:"));
                 
                 // Also verify caching headers are present alongside security headers
                 assert!(response.contains("ETag: W/"));
@@ -110,9 +111,10 @@ mod http_integration_tests {
         // Also test health endpoint (non-cached)
         match send_get_request("/health") {
             Ok(response) => {
-                assert!(response.contains("X-Frame-Options: DENY"));
                 assert!(response.contains("X-Content-Type-Options: nosniff"));
-                assert!(response.contains("Content-Security-Policy:"));
+                // Minimal headers approach - no CSP or X-Frame-Options for static cache server
+                assert!(!response.contains("X-Frame-Options:"));
+                assert!(!response.contains("Content-Security-Policy:"));
                 
                 println!("✓ Security headers present on health endpoint");
             }

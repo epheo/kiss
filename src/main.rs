@@ -57,11 +57,11 @@ impl HeaderTemplates {
         let (ready_headers, ready_body) = Self::create_ready_response();
         
         Self {
-            not_found: b"HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nContent-Length: 14\r\nX-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nContent-Security-Policy: default-src 'self'; style-src 'self' 'unsafe-inline' https:; script-src 'self' 'unsafe-inline' https:; img-src 'self' data: blob: https:; font-src 'self' data: https:; object-src 'self' data:; base-uri 'self'\r\nConnection: keep-alive\r\n\r\nFile not found".to_vec(),
-            method_not_allowed: b"HTTP/1.1 405 Method Not Allowed\r\nContent-Type: text/plain\r\nContent-Length: 18\r\nX-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nContent-Security-Policy: default-src 'self'; style-src 'self' 'unsafe-inline' https:; script-src 'self' 'unsafe-inline' https:; img-src 'self' data: blob: https:; font-src 'self' data: https:; object-src 'self' data:; base-uri 'self'\r\nConnection: keep-alive\r\n\r\nMethod not allowed".to_vec(),
-            request_too_large: b"HTTP/1.1 413 Request Entity Too Large\r\nContent-Type: text/plain\r\nContent-Length: 17\r\nX-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nContent-Security-Policy: default-src 'self'; style-src 'self' 'unsafe-inline' https:; script-src 'self' 'unsafe-inline' https:; img-src 'self' data: blob: https:; font-src 'self' data: https:; object-src 'self' data:; base-uri 'self'\r\nConnection: keep-alive\r\n\r\nRequest too large".to_vec(),
-            bad_request: b"HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\nContent-Length: 17\r\nX-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nContent-Security-Policy: default-src 'self'; style-src 'self' 'unsafe-inline' https:; script-src 'self' 'unsafe-inline' https:; img-src 'self' data: blob: https:; font-src 'self' data: https:; object-src 'self' data:; base-uri 'self'\r\nConnection: keep-alive\r\n\r\nMalformed request".to_vec(),
-            request_timeout: b"HTTP/1.1 408 Request Timeout\r\nContent-Type: text/plain\r\nContent-Length: 15\r\nX-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nContent-Security-Policy: default-src 'self'; style-src 'self' 'unsafe-inline' https:; script-src 'self' 'unsafe-inline' https:; img-src 'self' data: blob: https:; font-src 'self' data: https:; object-src 'self' data:; base-uri 'self'\r\nConnection: keep-alive\r\n\r\nRequest timeout".to_vec(),
+            not_found: b"HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nContent-Length: 14\r\nX-Content-Type-Options: nosniff\r\nConnection: keep-alive\r\n\r\nFile not found".to_vec(),
+            method_not_allowed: b"HTTP/1.1 405 Method Not Allowed\r\nContent-Type: text/plain\r\nContent-Length: 18\r\nX-Content-Type-Options: nosniff\r\nConnection: keep-alive\r\n\r\nMethod not allowed".to_vec(),
+            request_too_large: b"HTTP/1.1 413 Request Entity Too Large\r\nContent-Type: text/plain\r\nContent-Length: 17\r\nX-Content-Type-Options: nosniff\r\nConnection: keep-alive\r\n\r\nRequest too large".to_vec(),
+            bad_request: b"HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\nContent-Length: 17\r\nX-Content-Type-Options: nosniff\r\nConnection: keep-alive\r\n\r\nMalformed request".to_vec(),
+            request_timeout: b"HTTP/1.1 408 Request Timeout\r\nContent-Type: text/plain\r\nContent-Length: 15\r\nX-Content-Type-Options: nosniff\r\nConnection: keep-alive\r\n\r\nRequest timeout".to_vec(),
             not_modified: b"HTTP/1.1 304 Not Modified\r\nCache-Control: public, max-age=3600\r\nConnection: keep-alive\r\n\r\n".to_vec(),
             
             health_headers,
@@ -75,7 +75,7 @@ impl HeaderTemplates {
     fn create_health_response() -> (Vec<u8>, Vec<u8>) {
         let body = br#"{"status":"healthy","timestamp":"0"}"#.to_vec();
         let headers = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nX-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nContent-Security-Policy: default-src 'self'; style-src 'self' 'unsafe-inline' https:; script-src 'self' 'unsafe-inline' https:; img-src 'self' data: blob: https:; font-src 'self' data: https:; object-src 'self' data:; base-uri 'self'\r\nConnection: keep-alive\r\n\r\n",
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nX-Content-Type-Options: nosniff\r\nConnection: keep-alive\r\n\r\n",
             body.len()
         ).into_bytes();
         (headers, body)
@@ -84,7 +84,7 @@ impl HeaderTemplates {
     fn create_ready_response() -> (Vec<u8>, Vec<u8>) {
         let body = br#"{"status":"ready","timestamp":"0"}"#.to_vec();
         let headers = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nX-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nContent-Security-Policy: default-src 'self'; style-src 'self' 'unsafe-inline' https:; script-src 'self' 'unsafe-inline' https:; img-src 'self' data: blob: https:; font-src 'self' data: https:; object-src 'self' data:; base-uri 'self'\r\nConnection: keep-alive\r\n\r\n",
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nX-Content-Type-Options: nosniff\r\nConnection: keep-alive\r\n\r\n",
             body.len()
         ).into_bytes();
         (headers, body)
@@ -320,17 +320,11 @@ fn generate_file_metadata(file_path: &std::path::Path, relative_path: &str) -> R
     // Format HTTP date once during cache building - RFC 7231 compliant
     let last_modified_str = httpdate::fmt_http_date(last_modified);
     
-    // Pre-generate complete HTTP headers - eliminates all runtime allocations
-    // Conditionally include X-Frame-Options (exclude for SVG to allow <object> embedding)
-    let x_frame_options = if mime_type_str == "image/svg+xml" {
-        ""
-    } else {
-        "X-Frame-Options: DENY\r\n"
-    };
-    
+    // Pre-generate minimal HTTP headers for static cache server
+    // Only essential headers: caching, content type, and basic security
     let headers = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\nLast-Modified: {}\r\nETag: {}\r\nCache-Control: public, max-age=3600\r\nX-Content-Type-Options: nosniff\r\n{}Content-Security-Policy: default-src 'self'; style-src 'self' 'unsafe-inline' https:; script-src 'self' 'unsafe-inline' https:; img-src 'self' data: blob: https:; font-src 'self' data: https:; object-src 'self' data:; base-uri 'self'\r\nConnection: keep-alive\r\n\r\n",
-        mime_type_str, size, last_modified_str, etag, x_frame_options
+        "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\nLast-Modified: {}\r\nETag: {}\r\nCache-Control: public, max-age=3600\r\nX-Content-Type-Options: nosniff\r\nConnection: keep-alive\r\n\r\n",
+        mime_type_str, size, last_modified_str, etag
     ).into_bytes();
     
     // Pre-compute file path - eliminates runtime string building
@@ -433,14 +427,14 @@ async fn handle_connection(mut stream: TcpStream) {
 }
 
 async fn handle_connection_inner(stream: &mut TcpStream) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut reader = BufReader::new(stream);
-    
     loop {
         // Check for shutdown
         if SHUTDOWN.load(Ordering::Relaxed) {
             break;
         }
 
+        // Create fresh BufReader per request - optimal for brief line reading
+        let mut reader = BufReader::new(&mut *stream);
         let mut request_line = String::new();
 
         // Read request line with timeout
@@ -453,8 +447,7 @@ async fn handle_connection_inner(stream: &mut TcpStream) -> Result<(), Box<dyn s
             Ok(Ok(0)) | Err(_) => break, // Connection closed or timeout
             Ok(Err(_)) => break,         // Read error
             Ok(Ok(size)) if size > MAX_REQUEST_SIZE => {
-                reader.get_mut().write_all(&HEADER_TEMPLATES.get().unwrap().request_too_large).await?;
-                reader.get_mut().flush().await?;
+                send_precompiled_response(stream, &HEADER_TEMPLATES.get().unwrap().request_too_large).await?;
                 break;
             }
             Ok(Ok(_)) => {}
@@ -469,15 +462,13 @@ async fn handle_connection_inner(stream: &mut TcpStream) -> Result<(), Box<dyn s
         let (method, path, version) = match parse_request_line_fast(request_bytes) {
             Some((m, p, v)) => (m, p, v),
             None => {
-                reader.get_mut().write_all(&HEADER_TEMPLATES.get().unwrap().bad_request).await?;
-                reader.get_mut().flush().await?;
+                send_precompiled_response(stream, &HEADER_TEMPLATES.get().unwrap().bad_request).await?;
                 break;
             }
         };
 
         if method != b"GET" && method != b"HEAD" {
-            reader.get_mut().write_all(&HEADER_TEMPLATES.get().unwrap().method_not_allowed).await?;
-            reader.get_mut().flush().await?;
+            send_precompiled_response(stream, &HEADER_TEMPLATES.get().unwrap().method_not_allowed).await?;
             break;
         }
 
@@ -527,18 +518,27 @@ async fn handle_connection_inner(stream: &mut TcpStream) -> Result<(), Box<dyn s
         // Handle the request
         let is_head = method == b"HEAD";
         
-        // Use the underlying stream for response writing without destroying the BufReader
-        match handle_request(reader.get_mut(), path, is_head, if_modified_since.as_deref(), if_none_match.as_deref()).await {
+        // Direct stream usage for optimal response performance
+        match handle_request(stream, path, is_head, if_modified_since.as_deref(), if_none_match.as_deref()).await {
             Ok(_) => {
                 if !keep_alive {
                     break;
                 }
-                // BufReader remains intact for the next request - no recreation needed!
             }
             Err(_) => break,
         }
     }
 
+    Ok(())
+}
+
+// Helper function for sending precompiled responses efficiently
+async fn send_precompiled_response(
+    stream: &mut TcpStream,
+    response: &[u8],
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    stream.write_all(response).await?;
+    stream.flush().await?;
     Ok(())
 }
 
