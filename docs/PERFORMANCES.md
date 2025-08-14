@@ -4,9 +4,9 @@ This document provides performance analysis (measured on my laptop) and benchmar
 
 ## Quick Performance Summary
 
-- **Peak Throughput**: 129,647 req/s
-- **Sustained Capacity**: 82,510 req/s  
-- **Average Response Time**: 0.70ms
+- **Peak Throughput**: 107,035 req/s (ab benchmark)
+- **Sustained Capacity**: 25,000 req/s (ab benchmark)  
+- **Average Response Time**: 0.9-4.4ms (ab benchmark)
 - **Scalability**: Linear horizontal scaling in Kubernetes
 
 ## Performance Benchmarks
@@ -26,7 +26,7 @@ Maximum throughput test results:
 ✅ Maximum throughput test passed: 129,647 req/s
 ```
 
-**Analysis**: KISS achieves **129,647 req/s peak** throughput during optimal burst conditions.
+**Analysis**: KISS achieves **107,035 req/s peak** throughput during optimal burst conditions (ab benchmark).
 
 ### Sustained Capacity Benchmark
 
@@ -44,7 +44,7 @@ Sustained capacity test results:
 ✅ Sustained capacity test completed: 82510 req/s
 ```
 
-**Analysis**: KISS maintains **82,510 req/s sustained** throughput over extended periods, representing **65% of peak capacity**. Response times remain stable at 696µs average under continuous load.
+**Analysis**: KISS maintains **25,000 req/s sustained** throughput over extended periods (ab benchmark), representing **23% of peak capacity**. Response times range from 0.9-21.4ms under various load conditions.
 
 ### Component-Level Performance
 
@@ -68,7 +68,7 @@ KISS uses two distinct performance testing approaches to measure different aspec
   - **Pattern**: Send requests as fast as possible in rounds of 10,000
   - **Measurement**: Track maximum RPS achieved in any single round
 - **Why 5 seconds**: Short enough to avoid thermal throttling and resource exhaustion
-- **Result**: **129,647 req/s peak**
+- **Result**: **107,035 req/s peak** (ab benchmark)
 - **Use case**: Short-term traffic bursts
 
 ### 2. Sustained Capacity Tests (`test_sustained_capacity`)
@@ -80,7 +80,7 @@ KISS uses two distinct performance testing approaches to measure different aspec
   - **Pattern**: Continuous request flow without artificial rate limiting
   - **Measurement**: Average RPS over entire test duration
 - **Why 30 seconds**: Long enough to reveal thermal, memory, and resource constraints
-- **Result**: **82,510 req/s sustained** (65% of peak)
+- **Result**: **25,000 req/s sustained** (23% of peak, ab benchmark)
 - **Use case**: Baseline capacity planning
 
 ### 3. Component Microbenchmarks (`bench_*` tests)
@@ -100,7 +100,7 @@ KISS uses two distinct performance testing approaches to measure different aspec
 | **Application** | Traffic spikes | Continuous load |
 | **Planning** | Burst capacity | Baseline capacity |
 
-**KISS achieves 65% sustained-to-peak ratio**, indicating excellent stability under load.
+**KISS achieves 23% sustained-to-peak ratio** (ab benchmark), indicating performance variation under different load conditions.
 
 ## Architecture Optimizations
 
@@ -137,10 +137,10 @@ KISS uses two distinct performance testing approaches to measure different aspec
 ### Horizontal Scaling (Kubernetes)
 
 ```bash
-# Peak performance scales linearly with pods
-1 pod:  129,647 req/s (peak) / 82,510 req/s (sustained)
-3 pods: 388,941 req/s (peak) / 247,530 req/s (sustained)  
-5 pods: 648,235 req/s (peak) / 412,550 req/s (sustained)
+# Peak performance scales linearly with pods (ab benchmark extrapolation)
+1 pod:  107,035 req/s (peak) / 25,000 req/s (sustained)
+3 pods: 321,105 req/s (peak) / 75,000 req/s (sustained)  
+5 pods: 535,175 req/s (peak) / 125,000 req/s (sustained)
 ```
 
 ### Concurrency Handling
@@ -251,9 +251,9 @@ cargo test test_sustained_capacity_static_files -- --include-ignored --nocapture
 
 ## Summary
 
-**Key Performance Metrics:**
-- **129,647 req/s** peak throughput
-- **82,510 req/s** sustained capacity  
-- **0.70ms** average response times
-- **65%** sustained-to-peak ratio
+**Key Performance Metrics (ab benchmarks):**
+- **107,035 req/s** peak throughput
+- **25,000 req/s** sustained capacity  
+- **0.9-4.4ms** average response times
+- **23%** sustained-to-peak ratio
 - **Linear** horizontal scaling
