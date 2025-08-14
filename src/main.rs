@@ -13,7 +13,7 @@ use kiss::get_mime_type_enum;
 const PORT: u16 = 8080;
 const MAX_REQUEST_SIZE: usize = 8192;
 const STATIC_DIR: &str = ".";
-const MAX_FILE_SIZE: u64 = 50 * 1024 * 1024; // 50MB
+// MAX_FILE_SIZE removed - validation now happens during cache building only
 const CONNECTION_TIMEOUT_SECS: u64 = 30;
 const KEEPALIVE_TIMEOUT_SECS: u64 = 5;
 
@@ -24,7 +24,7 @@ static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 struct FileMetadata {
     headers: Vec<u8>,                // Pre-generated complete HTTP headers (biggest win)
     file_path: String,               // Pre-computed file path (eliminates string building)
-    size: u64,                       // Keep for conditional logic and file size limits
+    // size removed - no longer used for runtime validation
     last_modified: SystemTime,       // Keep for conditional request logic
     etag: String,                    // Keep for conditional logic
 }
@@ -39,7 +39,7 @@ struct HeaderTemplates {
     not_found: Vec<u8>,
     method_not_allowed: Vec<u8>,
     request_too_large: Vec<u8>,
-    file_too_large: Vec<u8>,
+    // file_too_large removed - files are validated during cache building
     bad_request: Vec<u8>,
     request_timeout: Vec<u8>,
     health_response: Vec<u8>,
@@ -52,7 +52,7 @@ impl HeaderTemplates {
             not_found: b"HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nContent-Length: 14\r\nX-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nContent-Security-Policy: default-src 'self'; style-src 'self' 'unsafe-inline' https:; script-src 'self' 'unsafe-inline' https:; img-src 'self' data: blob: https:; font-src 'self' data: https:; object-src 'self' data:; base-uri 'self'\r\nConnection: keep-alive\r\n\r\nFile not found".to_vec(),
             method_not_allowed: b"HTTP/1.1 405 Method Not Allowed\r\nContent-Type: text/plain\r\nContent-Length: 18\r\nX-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nContent-Security-Policy: default-src 'self'; style-src 'self' 'unsafe-inline' https:; script-src 'self' 'unsafe-inline' https:; img-src 'self' data: blob: https:; font-src 'self' data: https:; object-src 'self' data:; base-uri 'self'\r\nConnection: keep-alive\r\n\r\nMethod not allowed".to_vec(),
             request_too_large: b"HTTP/1.1 413 Request Entity Too Large\r\nContent-Type: text/plain\r\nContent-Length: 17\r\nX-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nContent-Security-Policy: default-src 'self'; style-src 'self' 'unsafe-inline' https:; script-src 'self' 'unsafe-inline' https:; img-src 'self' data: blob: https:; font-src 'self' data: https:; object-src 'self' data:; base-uri 'self'\r\nConnection: keep-alive\r\n\r\nRequest too large".to_vec(),
-            file_too_large: b"HTTP/1.1 413 Request Entity Too Large\r\nContent-Type: text/plain\r\nContent-Length: 14\r\nX-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nContent-Security-Policy: default-src 'self'; style-src 'self' 'unsafe-inline' https:; script-src 'self' 'unsafe-inline' https:; img-src 'self' data: https:; font-src 'self' data: https:; object-src 'self' data:; base-uri 'self'\r\nConnection: keep-alive\r\n\r\nFile too large".to_vec(),
+            // file_too_large removed - validation moved to cache building
             bad_request: b"HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\nContent-Length: 17\r\nX-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nContent-Security-Policy: default-src 'self'; style-src 'self' 'unsafe-inline' https:; script-src 'self' 'unsafe-inline' https:; img-src 'self' data: blob: https:; font-src 'self' data: https:; object-src 'self' data:; base-uri 'self'\r\nConnection: keep-alive\r\n\r\nMalformed request".to_vec(),
             request_timeout: b"HTTP/1.1 408 Request Timeout\r\nContent-Type: text/plain\r\nContent-Length: 15\r\nX-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nContent-Security-Policy: default-src 'self'; style-src 'self' 'unsafe-inline' https:; script-src 'self' 'unsafe-inline' https:; img-src 'self' data: blob: https:; font-src 'self' data: https:; object-src 'self' data:; base-uri 'self'\r\nConnection: keep-alive\r\n\r\nRequest timeout".to_vec(),
             health_response: Self::create_health_response(),
@@ -324,7 +324,7 @@ fn generate_file_metadata(file_path: &std::path::Path, relative_path: &str) -> R
     Ok(FileMetadata {
         headers,
         file_path: full_file_path,
-        size,
+        // size removed - no longer needed for runtime
         last_modified,
         etag,
     })
@@ -554,10 +554,7 @@ async fn serve_static_file(
 
     // Try to get file metadata from cache
     if let Some(file_metadata) = file_metadata {
-        // Check file size limit (already validated during cache build, but double-check)
-        if file_metadata.size > MAX_FILE_SIZE {
-            return send_precompiled_response(stream, &HEADER_TEMPLATES.get().unwrap().file_too_large).await;
-        }
+        // Files in cache are already validated during startup - no need to re-check size
 
         // Handle conditional requests for 304 Not Modified
         if let Some(should_return_304) = should_return_not_modified(

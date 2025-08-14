@@ -319,7 +319,7 @@ mod performance_regression_tests {
             let start = Instant::now();
             
             for _ in 0..ITERATIONS {
-                let _result = kiss::get_mime_type(file);
+                let _result = kiss::get_mime_type_enum(std::path::Path::new(file));
             }
             
             let duration = start.elapsed();
@@ -408,7 +408,7 @@ mod benchmark_tests {
         for _ in 0..ITERATIONS {
             for ext in &common_types {
                 let filename = format!("file.{}", ext);
-                let _result = kiss::get_mime_type(&filename);
+                let _result = kiss::get_mime_type_enum(std::path::Path::new(&filename));
             }
         }
         let duration = start.elapsed();

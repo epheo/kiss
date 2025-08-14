@@ -51,7 +51,7 @@ impl MimeType {
 }
 
 
-// Fast MIME type detection - optimized internal implementation
+// Fast MIME type detection - optimized implementation for cache building and tests
 pub fn get_mime_type_enum(file_path: &Path) -> MimeType {
     if let Some(extension) = file_path.extension().and_then(|s| s.to_str()) {
         // Use direct string matching instead of HashMap lookup - much faster
@@ -79,7 +79,3 @@ pub fn get_mime_type_enum(file_path: &Path) -> MimeType {
     }
 }
 
-// Public API - maintains original string-based interface for compatibility
-pub fn get_mime_type(file_path: &str) -> &'static str {
-    get_mime_type_enum(Path::new(file_path)).as_str()
-}

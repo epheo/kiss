@@ -1,4 +1,4 @@
-use kiss::*;
+use kiss::get_mime_type_enum;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::time::Duration;
@@ -20,7 +20,7 @@ mod file_system_error_tests {
         ];
         
         for file in &test_files {
-            let mime_type = get_mime_type(file);
+            let mime_type = get_mime_type_enum(std::path::Path::new(file)).as_str();
             assert!(!mime_type.is_empty(), "MIME type should not be empty for: {}", file);
             assert_ne!(mime_type, "", "MIME type should be determined for: {}", file);
         }
@@ -169,7 +169,7 @@ mod resource_exhaustion_tests {
         let long_extension = "x".repeat(1000);
         let file_with_long_ext = format!("file.{}", long_extension);
         
-        let mime_type = get_mime_type(&file_with_long_ext);
+        let mime_type = get_mime_type_enum(std::path::Path::new(&file_with_long_ext)).as_str();
         // Should handle gracefully
         assert_eq!(mime_type, "application/octet-stream", 
                   "Very long extension should default to octet-stream");
@@ -243,7 +243,7 @@ mod error_recovery_tests {
         ];
         
         for filename in &edge_cases {
-            let mime_type = get_mime_type(filename);
+            let mime_type = get_mime_type_enum(std::path::Path::new(filename)).as_str();
             // Should not panic and should return something
             assert!(!mime_type.is_empty(), "MIME type should not be empty for: {:?}", filename);
         }
