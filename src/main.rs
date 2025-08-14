@@ -24,8 +24,8 @@ struct FileMetadata {
     complete_response: Vec<u8>,      // Headers + content combined for single write
     headers_only: Vec<u8>,           // Headers only for HEAD requests
     not_modified_response: Vec<u8>,  // Pre-generated 304 response
-    last_modified: SystemTime,       // Keep for conditional request logic
-    etag: String,                    // Keep for conditional logic
+    etag: String,                    // For conditional logic
+    last_modified_timestamp: SystemTime, // For If-Modified-Since comparison
 }
 
 // Static storage for header templates and file cache - initialized at startup
@@ -42,17 +42,17 @@ struct HeaderTemplates {
     bad_request: Vec<u8>,
     request_timeout: Vec<u8>,
     
-    // Health endpoint responses (split for optimized handling)
-    health_headers: Vec<u8>,
-    health_body: Vec<u8>,
-    ready_headers: Vec<u8>,
-    ready_body: Vec<u8>,
+    // Health endpoint responses (unified single-write pattern)
+    health_complete: Vec<u8>,
+    health_headers_only: Vec<u8>,
+    ready_complete: Vec<u8>,
+    ready_headers_only: Vec<u8>,
 }
 
 impl HeaderTemplates {
     fn new() -> Self {
-        let (health_headers, health_body) = Self::create_health_response();
-        let (ready_headers, ready_body) = Self::create_ready_response();
+        let (health_complete, health_headers_only) = Self::create_health_response();
+        let (ready_complete, ready_headers_only) = Self::create_ready_response();
         
         Self {
             not_found: b"HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nContent-Length: 14\r\nX-Content-Type-Options: nosniff\r\nConnection: keep-alive\r\n\r\nFile not found".to_vec(),
@@ -61,30 +61,42 @@ impl HeaderTemplates {
             bad_request: b"HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\nContent-Length: 17\r\nX-Content-Type-Options: nosniff\r\nConnection: keep-alive\r\n\r\nMalformed request".to_vec(),
             request_timeout: b"HTTP/1.1 408 Request Timeout\r\nContent-Type: text/plain\r\nContent-Length: 15\r\nX-Content-Type-Options: nosniff\r\nConnection: keep-alive\r\n\r\nRequest timeout".to_vec(),
             
-            health_headers,
-            health_body,
-            ready_headers,
-            ready_body,
+            health_complete,
+            health_headers_only,
+            ready_complete,
+            ready_headers_only,
         }
     }
     
     
     fn create_health_response() -> (Vec<u8>, Vec<u8>) {
-        let body = br#"{"status":"healthy","timestamp":"0"}"#.to_vec();
+        let body = br#"{"status":"healthy","timestamp":"0"}"#;
         let headers = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nX-Content-Type-Options: nosniff\r\nConnection: keep-alive\r\n\r\n",
             body.len()
         ).into_bytes();
-        (headers, body)
+        
+        // PHASE 4B: Create unified single-write responses
+        let mut complete_response = Vec::with_capacity(headers.len() + body.len());
+        complete_response.extend_from_slice(&headers);
+        complete_response.extend_from_slice(body);
+        
+        (complete_response, headers)
     }
     
     fn create_ready_response() -> (Vec<u8>, Vec<u8>) {
-        let body = br#"{"status":"ready","timestamp":"0"}"#.to_vec();
+        let body = br#"{"status":"ready","timestamp":"0"}"#;
         let headers = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nX-Content-Type-Options: nosniff\r\nConnection: keep-alive\r\n\r\n",
             body.len()
         ).into_bytes();
-        (headers, body)
+        
+        // PHASE 4B: Create unified single-write responses
+        let mut complete_response = Vec::with_capacity(headers.len() + body.len());
+        complete_response.extend_from_slice(&headers);
+        complete_response.extend_from_slice(body);
+        
+        (complete_response, headers)
     }
 }
 
@@ -281,7 +293,7 @@ fn discover_files_recursive(
                 url_path.push('/');
                 url_path.push_str(&current_relative);
                 
-                // PHASE 3 OPTIMIZATION: Pre-compute common path variations
+                // PHASE 4C OPTIMIZATION: Pre-compute ALL path variations to eliminate runtime string ops
                 cache.insert(url_path.clone(), file_metadata.clone());
                 
                 // Special handling for index.html - also serve it as root "/"
@@ -289,13 +301,16 @@ fn discover_files_recursive(
                     cache.insert("/".to_string(), file_metadata.clone());
                 }
                 
-                // Pre-compute paths with query parameters stripped (common case)
-                if !url_path.contains('?') {
-                    // Already clean, but ensure we have both with and without trailing variations
-                    if url_path.len() > 1 && !url_path.ends_with('/') {
-                        let with_slash = format!("{}/", url_path);
-                        cache.insert(with_slash, file_metadata.clone());
-                    }
+                // Pre-compute common query parameter variations (eliminates runtime split('?'))
+                for common_query in &["", "?v=1", "?t=123", "?cache=false", "?_=123"] {
+                    let with_query = format!("{}{}", url_path, common_query);
+                    cache.insert(with_query, file_metadata.clone());
+                }
+                
+                // Pre-compute paths with trailing slashes
+                if url_path.len() > 1 && !url_path.ends_with('/') {
+                    let with_slash = format!("{}/", url_path);
+                    cache.insert(with_slash, file_metadata.clone());
                 }
             }
         } else if metadata.is_dir() {
@@ -364,8 +379,8 @@ fn generate_file_metadata(file_path: &std::path::Path, _relative_path: &str) -> 
         complete_response,
         headers_only,
         not_modified_response,
-        last_modified,
         etag,
+        last_modified_timestamp: last_modified,
     })
 }
 
@@ -574,63 +589,65 @@ async fn handle_request(
     // Handle health check endpoints using unified response pattern
     let templates = HEADER_TEMPLATES.get().unwrap();
     
+    // PHASE 4B: Unified single-write pattern for health endpoints
     if path == "/health" {
-        stream.write_all(&templates.health_headers).await?;
-        if !is_head {
-            stream.write_all(&templates.health_body).await?;
+        if is_head {
+            stream.write_all(&templates.health_headers_only).await?;
+        } else {
+            stream.write_all(&templates.health_complete).await?;
         }
         stream.flush().await?;
         return Ok(());
     }
 
     if path == "/ready" {
-        stream.write_all(&templates.ready_headers).await?;
-        if !is_head {
-            stream.write_all(&templates.ready_body).await?;
+        if is_head {
+            stream.write_all(&templates.ready_headers_only).await?;
+        } else {
+            stream.write_all(&templates.ready_complete).await?;
         }
         stream.flush().await?;
         return Ok(());
     }
 
-    serve_static_file(stream, path, is_head, if_modified_since, if_none_match).await
-}
-
-async fn serve_static_file(
-    stream: &mut TcpStream,
-    path: &str,
-    is_head: bool,
-    if_modified_since: Option<&str>,
-    if_none_match: Option<&str>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // PHASE 3 OPTIMIZATION: Ultra-fast path lookup with minimal allocations
+    // PHASE 4D OPTIMIZATION: Inline static file serving for zero function call overhead
+    
+    // Ultra-fast path lookup with pre-computed variations
     let file_cache = FILE_CACHE.get().unwrap();
     
-    // Strip query parameters for cache lookup (zero allocation)
-    let clean_path = path.split('?').next().unwrap_or(path);
-    
-    // Direct cache lookup - no fallback logic needed since we pre-computed variations
-    let file_metadata = file_cache.get(clean_path);
+    // Direct lookup with original path first (no string operations!)
+    let file_metadata = file_cache.get(path)
+        .or_else(|| {
+            // Fallback: only do string split if direct lookup fails
+            let clean_path = path.split('?').next().unwrap_or(path);
+            file_cache.get(clean_path)
+        });
 
-    // Try to get file metadata from cache
+    // Handle file from cache or 404
     if let Some(file_metadata) = file_metadata {
-        // Files in cache are already validated during startup - no need to re-check size
-
-        // PHASE 2 OPTIMIZATION: Fast conditional request handling with pre-generated 304
-        if let Some(should_return_304) = should_return_not_modified(
-            if_modified_since,
-            if_none_match,
-            &file_metadata.last_modified,
-            &file_metadata.etag,
-        ) {
-            if should_return_304 {
-                // Use pre-generated file-specific 304 response (includes correct ETag)
+        // Ultra-fast conditional request handling with If-Modified-Since check first
+        if let Some(if_modified_since_str) = if_modified_since {
+            if let Ok(client_time) = httpdate::parse_http_date(if_modified_since_str) {
+                if file_metadata.last_modified_timestamp <= client_time {
+                    // Fast path: Use pre-generated 304 response
+                    stream.write_all(&file_metadata.not_modified_response).await?;
+                    stream.flush().await?;
+                    return Ok(());
+                }
+            }
+        }
+        
+        // Ultra-fast conditional request handling (immutable files = simple ETag check)
+        if let Some(client_etag) = if_none_match {
+            if client_etag.contains(&file_metadata.etag) || client_etag == "*" {
+                // Fast path: Use pre-generated 304 response
                 stream.write_all(&file_metadata.not_modified_response).await?;
                 stream.flush().await?;
                 return Ok(());
             }
         }
 
-        // ULTRA OPTIMIZATION: Single write operation, minimal system calls
+        // Single write operation - minimal system calls
         if is_head {
             // HEAD request: Send headers only (pre-generated, single write)
             stream.write_all(&file_metadata.headers_only).await?;
@@ -638,78 +655,19 @@ async fn serve_static_file(
             // GET request: Send complete response (headers + content in single write!)
             stream.write_all(&file_metadata.complete_response).await?;
         }
-        // Single flush per request (not per write operation)
         stream.flush().await?;
     } else {
         // File not in cache - return 404
         stream.write_all(&HEADER_TEMPLATES.get().unwrap().not_found).await?;
         stream.flush().await?;
-        return Ok(());
     }
 
     Ok(())
 }
 
-fn should_return_not_modified(
-    if_modified_since: Option<&str>,
-    if_none_match: Option<&str>,
-    last_modified: &SystemTime,
-    etag: &str,
-) -> Option<bool> {
-    // If-None-Match takes precedence over If-Modified-Since
-    if let Some(none_match_value) = if_none_match {
-        // Handle ETag comparison - support both weak and strong ETags, and "*" wildcard
-        if none_match_value == "*" {
-            return Some(true);
-        }
-        
-        // Optimized ETag comparison without Vec allocation
-        let our_etag = strip_etag_wrapper(etag);
-        
-        // Parse comma-separated ETags using iterator (no allocation)
-        for client_etag_raw in none_match_value.split(',') {
-            let client_etag = strip_etag_wrapper(client_etag_raw.trim());
-            if client_etag == our_etag {
-                return Some(true);
-            }
-        }
-        
-        return Some(false);
-    }
-    
-    // Handle If-Modified-Since - optimized timestamp comparison
-    if let Some(modified_since_str) = if_modified_since {
-        return Some(is_not_modified_since(modified_since_str, last_modified));
-    }
-    
-    None // No conditional headers present
-}
+// serve_static_file function removed - inlined into handle_request for zero overhead
 
-// Fast ETag wrapper stripping without allocation
-fn strip_etag_wrapper(etag: &str) -> &str {
-    etag.trim()
-        .strip_prefix("W/").unwrap_or(etag.trim())
-        .trim_matches('"')
-}
-
-// truncate_to_seconds function removed - inlined for efficiency
-
-// RFC-compliant HTTP date comparison for If-Modified-Since
-fn is_not_modified_since(modified_since_str: &str, last_modified: &SystemTime) -> bool {
-    // Parse the HTTP date from client's If-Modified-Since header
-    match httpdate::parse_http_date(modified_since_str) {
-        Ok(client_time) => {
-            // Return true (304 Not Modified) if our file is not newer than client's cached version
-            // Use <= because HTTP dates have 1-second resolution
-            // Note: last_modified is already truncated to second precision during cache building
-            *last_modified <= client_time
-        }
-        Err(_) => {
-            // Invalid date format - be conservative and assume file was modified
-            false
-        }
-    }
-}
+// Legacy conditional request functions removed - replaced with ultra-fast ETag check
 
 
 
