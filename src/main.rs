@@ -681,8 +681,8 @@ async fn handle_connection_inner(stream: &mut TcpStream) -> Result<(), Box<dyn s
 
         // Enhanced connection management - faster header parsing
         let mut keep_alive = version == "HTTP/1.1"; // Default for HTTP/1.1
-        let mut if_modified_since: Option<String> = None;
-        let mut if_none_match: Option<String> = None;
+        let mut if_modified_since: Option<Vec<u8>> = None;
+        let mut if_none_match: Option<Vec<u8>> = None;
         
         // Ultra-optimized header parsing with minimal allocations
         let mut header_buffer = Vec::with_capacity(256); // Pre-allocate reasonable buffer
@@ -709,11 +709,11 @@ async fn handle_connection_inner(stream: &mut TcpStream) -> Result<(), Box<dyn s
                         keep_alive = !connection_close_requested && (version == "HTTP/1.1" || header_contains(line, b"keep-alive"));
                     } else if header_starts_with(line, b"if-modified-since:") {
                         if let Some(value) = extract_header_value(line, b"if-modified-since:") {
-                            if_modified_since = Some(String::from_utf8_lossy(value).into_owned());
+                            if_modified_since = Some(value.to_vec());
                         }
                     } else if header_starts_with(line, b"if-none-match:") {
                         if let Some(value) = extract_header_value(line, b"if-none-match:") {
-                            if_none_match = Some(String::from_utf8_lossy(value).into_owned());
+                            if_none_match = Some(value.to_vec());
                         }
                     }
                 }
@@ -752,8 +752,8 @@ async fn handle_request(
     stream: &mut TcpStream,
     path: &str,
     is_head: bool,
-    if_modified_since: Option<&str>,
-    if_none_match: Option<&str>,
+    if_modified_since: Option<&[u8]>,
+    if_none_match: Option<&[u8]>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Handle health check endpoints using unified response pattern
     let templates = HEADER_TEMPLATES.get().unwrap();
@@ -790,20 +790,26 @@ async fn handle_request(
     // Handle file from cache or 404
     if let Some(cache_entry) = cache_entry {
         // Ultra-fast conditional request handling with If-Modified-Since check first
-        if let Some(if_modified_since_str) = if_modified_since {
-            if let Ok(client_time) = httpdate::parse_http_date(if_modified_since_str) {
-                if cache_entry.last_modified_timestamp <= client_time {
-                    // Fast path: Use pre-generated 304 response
-                    stream.write_all(&cache_entry.not_modified_response).await?;
-                    stream.flush().await?;
-                    return Ok(());
+        if let Some(if_modified_since_bytes) = if_modified_since {
+            // Convert bytes to string only when needed for parsing
+            if let Ok(if_modified_since_str) = std::str::from_utf8(if_modified_since_bytes) {
+                if let Ok(client_time) = httpdate::parse_http_date(if_modified_since_str) {
+                    if cache_entry.last_modified_timestamp <= client_time {
+                        // Fast path: Use pre-generated 304 response
+                        stream.write_all(&cache_entry.not_modified_response).await?;
+                        stream.flush().await?;
+                        return Ok(());
+                    }
                 }
             }
         }
         
         // Ultra-fast conditional request handling (immutable files = simple ETag check)
-        if let Some(client_etag) = if_none_match {
-            if client_etag.contains(&*cache_entry.etag) || client_etag == "*" {
+        if let Some(client_etag_bytes) = if_none_match {
+            // Perform direct byte comparison for ETag matching
+            let etag_bytes = cache_entry.etag.as_bytes();
+            if client_etag_bytes == b"*" || 
+               (client_etag_bytes.windows(etag_bytes.len()).any(|window| window == etag_bytes)) {
                 // Fast path: Use pre-generated 304 response
                 stream.write_all(&cache_entry.not_modified_response).await?;
                 stream.flush().await?;

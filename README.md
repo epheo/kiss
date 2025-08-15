@@ -27,8 +27,20 @@ The following features are deliberately omitted from KISS because they are handl
 - **Compression** - Ingress can add gzip/brotli compression
 - **HTTP/2 & HTTP/3** - Ingress provides modern protocol support
 - **URL Rewriting** - Ingress handles path manipulation and redirects
+- **POST/PUT** - This is a static file serving only server
 
 This division follows cloud-native principles where each component has a single responsibility, reducing complexity and attack surface.
+
+## What KISS do implement
+
+- Ultra-low latency: Direct TCP + zero-copy responses
+- Minimal memory footprint: Lock-free cache, pre-compiled responses
+- Zero I/O overhead: Complete file preloading at startup
+- Optimized request parsing: Single-pass HTTP parsing with FNV hashing
+- Single-write responses: Headers + content combined
+- CPU efficiency: No framework overhead, minimal allocations
+- Predictable performance (no GC, minimal branching)
+- Container optimized (scratch image, few kb)
 
 ## Usage
 

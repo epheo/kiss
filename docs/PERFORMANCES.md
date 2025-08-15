@@ -8,12 +8,12 @@ KISS implements an in-memory architecture that pre-loads all static files at sta
 
 Those tests have been performed on my laptop "12th Gen Intel(R) Core(TM) i7-1280P"
 
-**Benchmark Results (Apache Bench, 10,000 requests):**
-- Peak throughput: 198,080 req/s
-- Small file performance: 198,080 req/s vs nginx 157,744 req/s
+**Benchmark Results (Apache Bench):**
+- Peak throughput: 216,460 req/s (100,000 requests, 100 concurrent)
+- Small file performance: 198,080 req/s vs nginx 157,744 req/s (10,000 requests)
 - Medium file performance: 60,930 req/s vs nginx 45,086 req/s  
 - Cache performance: 82,924 req/s vs nginx 77,813 req/s
-- Response time: 0.5-1.6ms for files under 1MB
+- Response time: 0.462ms mean (100,000 requests), 0.5-1.6ms for files under 1MB
 - Architecture: Zero disk I/O with pre-loaded content
 
 ## KISS vs nginx Comprehensive Comparison
@@ -136,9 +136,9 @@ Example calculations:
 ## Summary
 
 **Performance Characteristics:**
-- Peak throughput: 198,080 req/s
+- Peak throughput: 216,460 req/s (100,000 requests benchmark)
 - Medium file performance: 60,930 req/s
-- Response times: 0.5-1.6ms for files under 1MB
+- Response times: 0.462ms mean (100,000 requests), 0.5-1.6ms for files under 1MB
 - Architecture: In-memory serving with zero disk I/O
 - Scaling: Linear horizontal scaling in Kubernetes environments
 - Optimal use cases: Static websites, documentation, containerized deployments with files under 1MB
