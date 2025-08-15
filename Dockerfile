@@ -17,12 +17,6 @@ COPY src ./src
 # Build static binary
 RUN cargo build --release --target x86_64-unknown-linux-musl
 
-# Final stage: scratch image
-FROM scratch
-
-# Copy the static binary
-COPY --from=builder /app/target/x86_64-unknown-linux-musl/release/kiss /kiss
-
 RUN mkdir /content && chmod 755 /content
 
 # Back to scratch for final image
