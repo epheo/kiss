@@ -377,7 +377,7 @@ fn generate_file_metadata(file_path: &std::path::Path, _relative_path: &str) -> 
         mime_type_str, actual_size, last_modified_str, etag
     ).into_bytes();
     
-    // ULTIMATE OPTIMIZATION: Pre-combine headers + content for single write()
+    // Pre-combine headers + content for single write()
     let mut complete_response = Vec::with_capacity(headers.len() + content.len());
     complete_response.extend_from_slice(&headers);
     complete_response.extend_from_slice(&content);

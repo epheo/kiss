@@ -40,7 +40,7 @@ Create a `Dockerfile` that builds upon KISS:
 
 #### Example 1: Serving Static Files
 ```dockerfile
-FROM kiss:latest
+FROM quay.io/epheo/kiss:latest
 COPY ./my-website/ /content/
 ```
 
@@ -72,7 +72,7 @@ COPY . .
 RUN sphinx-build -b html . _build/html
 
 # Serve with KISS
-FROM kiss:latest
+FROM quay.io/epheo/kiss:latest
 COPY --from=builder /docs/_build/html/ /
 ```
 
@@ -88,8 +88,8 @@ docs-project/
 
 Build and run:
 ```bash
-docker build -t my-docs .
-docker run -p 8080:8080 --read-only my-docs
+podman build -t my-docs .
+podman run -p 8080:8080 --read-only my-docs
 ```
 
 **Kubernetes Deployment:**
@@ -243,7 +243,7 @@ spec:
             port: 8080
         volumeMounts:
         - name: static-files
-          mountPath: /app/static
+          mountPath: /content
           readOnly: true
       volumes:
       - name: static-files
