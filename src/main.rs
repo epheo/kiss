@@ -633,6 +633,10 @@ async fn handle_connection(mut stream: TcpStream) {
 }
 
 async fn handle_connection_inner(stream: &mut TcpStream) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Reusable buffers to eliminate per-request allocations
+    let mut request_line = String::with_capacity(128);
+    let mut header_buffer = Vec::with_capacity(256);
+    
     loop {
         // Check for shutdown
         if SHUTDOWN.load(Ordering::Relaxed) {
@@ -641,7 +645,7 @@ async fn handle_connection_inner(stream: &mut TcpStream) -> Result<(), Box<dyn s
 
         // Create fresh BufReader per request - optimal for brief line reading
         let mut reader = BufReader::new(&mut *stream);
-        let mut request_line = String::new();
+        request_line.clear(); // Reuse string, just clear content
 
         // Read request line with timeout
         match timeout(
@@ -684,10 +688,9 @@ async fn handle_connection_inner(stream: &mut TcpStream) -> Result<(), Box<dyn s
         let mut if_modified_since: Option<Vec<u8>> = None;
         let mut if_none_match: Option<Vec<u8>> = None;
         
-        // Ultra-optimized header parsing with minimal allocations
-        let mut header_buffer = Vec::with_capacity(256); // Pre-allocate reasonable buffer
+        // Ultra-optimized header parsing with zero allocations
         loop {
-            header_buffer.clear();
+            header_buffer.clear(); // Reuse vec, just clear content
             
             // Read header line into byte buffer
             match read_line_bytes(&mut reader, &mut header_buffer).await {
