@@ -145,7 +145,7 @@ mod http_integration_tests {
     }
 
     #[test]
-    #[ignore] // Requires server to be running from tests/content/
+    #[ignore] // Requires server to be running from tests/ directory
     fn test_svg_content_type() {
         match send_get_request("/test.svg") {
             Ok(response) => {
@@ -155,14 +155,14 @@ mod http_integration_tests {
                 println!("SVG Content-Type test passed: image/svg+xml header found");
             }
             Err(_) => {
-                println!("Warning: Server not running from tests/content/, skipping SVG test");
-                println!("To run this test: cd tests/content && ../../target/release/kiss");
+                println!("Warning: Server not running from tests/ directory, skipping SVG test");
+                println!("To run this test: cd tests && ../target/release/kiss");
             }
         }
     }
 
     #[test]
-    #[ignore] // Requires server to be running from tests/content/
+    #[ignore] // Requires server to be running from tests/ directory
     fn test_multiple_content_types_with_caching() {
         // Test various file types from tests/content/ - now with cache validation
         let test_cases = vec![
@@ -191,7 +191,7 @@ mod http_integration_tests {
                     println!("✓ {} served with correct Content-Type: {} and cache headers", path, expected_content_type);
                 }
                 Err(_) => {
-                    println!("Warning: Server not running from tests/content/, skipping {}", path);
+                    println!("Warning: Server not running from tests/ directory, skipping {}", path);
                 }
             }
         }
@@ -219,7 +219,7 @@ mod http_integration_tests {
     }
 
     #[test]
-    #[ignore] // Requires server to be running from tests/content/
+    #[ignore] // Requires server to be running from tests/ directory
     fn test_etag_headers_present() {
         match send_get_request("/index.html") {
             Ok(response) => {
@@ -235,19 +235,19 @@ mod http_integration_tests {
                 println!("✓ ETag and caching headers present in response");
             }
             Err(_) => {
-                println!("Warning: Server not running from tests/content/, skipping ETag test");
+                println!("Warning: Server not running from tests/ directory, skipping ETag test");
             }
         }
     }
 
     #[test]
-    #[ignore] // Requires server to be running from tests/content/
+    #[ignore] // Requires server to be running from tests/ directory
     fn test_conditional_request_etag_match() {
         // First, get the file to extract its ETag
         let initial_response = match send_get_request("/index.html") {
             Ok(response) => response,
             Err(_) => {
-                println!("Warning: Server not running from tests/content/, skipping conditional request test");
+                println!("Warning: Server not running from tests/ directory, skipping conditional request test");
                 return;
             }
         };
@@ -299,7 +299,7 @@ mod http_integration_tests {
     }
 
     #[test]
-    #[ignore] // Requires server to be running from tests/content/
+    #[ignore] // Requires server to be running from tests/ directory
     fn test_conditional_request_wildcard_etag() {
         // Test If-None-Match with wildcard should always return 304
         match send_conditional_request("/index.html", None, Some("*")) {
@@ -309,19 +309,19 @@ mod http_integration_tests {
                 println!("✓ If-None-Match with wildcard ETag returned 304");
             }
             Err(_) => {
-                println!("Warning: Server not running from tests/content/, skipping wildcard ETag test");
+                println!("Warning: Server not running from tests/ directory, skipping wildcard ETag test");
             }
         }
     }
 
     #[test]
-    #[ignore] // Requires server to be running from tests/content/
+    #[ignore] // Requires server to be running from tests/ directory
     fn test_conditional_request_if_modified_since() {
         // First, get the file to extract its Last-Modified timestamp
         let initial_response = match send_get_request("/index.html") {
             Ok(response) => response,
             Err(_) => {
-                println!("Warning: Server not running from tests/content/, skipping If-Modified-Since test");
+                println!("Warning: Server not running from tests/ directory, skipping If-Modified-Since test");
                 return;
             }
         };
@@ -372,7 +372,7 @@ mod http_integration_tests {
     }
 
     #[test]
-    #[ignore] // Requires server to be running from tests/content/
+    #[ignore] // Requires server to be running from tests/ directory
     fn test_head_request_with_cache_headers() {
         let mut stream = TcpStream::connect("127.0.0.1:8080").unwrap_or_else(|_| {
             panic!("Server not running");
@@ -486,7 +486,7 @@ mod path_security_integration_tests {
     
     // Test that query parameters in URLs are handled correctly
     #[test]
-    #[ignore] // Requires server to be running from tests/content/
+    #[ignore] // Requires server to be running from tests/ directory
     fn test_query_parameter_handling() {
         let query_paths = vec![
             ("/index.html?v=1", true),           // Should serve index.html
@@ -515,7 +515,7 @@ mod path_security_integration_tests {
                     }
                 }
                 Err(_) => {
-                    println!("Warning: Server not running from tests/content/, skipping query test for {}", path);
+                    println!("Warning: Server not running from tests/ directory, skipping query test for {}", path);
                 }
             }
         }
@@ -523,7 +523,7 @@ mod path_security_integration_tests {
     
     // Test that fragment identifiers are handled (though they rarely reach server)
     #[test]
-    #[ignore] // Requires server to be running from tests/content/
+    #[ignore] // Requires server to be running from tests/ directory
     fn test_fragment_handling() {
         let fragment_paths = vec![
             "/index.html#section",
@@ -544,7 +544,7 @@ mod path_security_integration_tests {
                     }
                 }
                 Err(_) => {
-                    println!("Warning: Server not running from tests/content/, skipping fragment test for {}", path);
+                    println!("Warning: Server not running from tests/ directory, skipping fragment test for {}", path);
                 }
             }
         }
@@ -552,7 +552,7 @@ mod path_security_integration_tests {
     
     // Test that legitimate paths still work correctly
     #[test]
-    #[ignore] // Requires server to be running from tests/content/
+    #[ignore] // Requires server to be running from tests/ directory
     fn test_legitimate_paths_still_work() {
         let valid_paths = vec![
             "/index.html",
@@ -570,7 +570,7 @@ mod path_security_integration_tests {
                     println!("✓ Legitimate path works: {}", path);
                 }
                 Err(_) => {
-                    println!("Warning: Server not running from tests/content/, skipping legitimate path test for {}", path);
+                    println!("Warning: Server not running from tests/ directory, skipping legitimate path test for {}", path);
                 }
             }
         }

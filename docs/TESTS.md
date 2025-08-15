@@ -97,12 +97,12 @@ Use the tmux script for automatic setup and execution of all tests:
 
 The script will:
 1. Build the release binary
-2. Start server from `tests/content/` in one tmux window
+2. Start server from `tests/` directory (serving `tests/content/`) in one tmux window
 3. Run all tests (including server-dependent ones) in another window
 4. Attach you to the tmux session to view results
 
 **Test Content Directory (`tests/content/`)**
-- Contains static files for integration testing
+- Contains static files for integration testing (server runs from `tests/` and serves `tests/content/`)
 - `test.svg` - SVG file for testing `image/svg+xml` content-type
 - `index.html` - HTML file with links to all test assets
 - `style.css` - CSS file for testing `text/css` content-type  

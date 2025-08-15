@@ -22,10 +22,10 @@ sleep 1
 echo "Building release binary..."
 cargo build --release
 
-# Create tmux session and run server from content directory
-echo "Starting server from tests/content/..."
+# Create tmux session and run server from tests directory (which contains content subdir)
+echo "Starting server from tests/ directory (serving tests/content/)..."
 tmux new-session -d -s kiss-tests -n server
-tmux send-keys -t kiss-tests:server "cd tests/content && ../../target/release/kiss" Enter
+tmux send-keys -t kiss-tests:server "cd tests && ../target/release/kiss" Enter
 
 # Wait for server to start
 sleep 2

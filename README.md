@@ -12,7 +12,7 @@ KISS implements an in-memory architecture that pre-loads static files at startup
 - Container-optimized for Kubernetes deployments
 - Minimal dependencies and attack surface
 
-KISS serves files from the container root directory (`/`) while protecting the server binary at `/kiss`.
+KISS serves files from the container content directory (`/content/`) while protecting the server binary at `/kiss`.
 
 
 ## What KISS does NOT implement (by design)
@@ -41,7 +41,7 @@ Create a `Dockerfile` that builds upon KISS:
 #### Example 1: Serving Static Files
 ```dockerfile
 FROM kiss:latest
-COPY ./my-website/ /
+COPY ./my-website/ /content/
 ```
 
 Your directory structure:

@@ -23,6 +23,20 @@ FROM scratch
 # Copy the static binary
 COPY --from=builder /app/target/x86_64-unknown-linux-musl/release/kiss /kiss
 
+# Create content directory with proper permissions
+# Using busybox temporarily to create directory
+FROM busybox AS dirbuilder
+RUN mkdir -p /content && chmod 755 /content
+
+# Back to scratch for final image
+FROM scratch
+
+# Copy the static binary
+COPY --from=builder /app/target/x86_64-unknown-linux-musl/release/kiss /kiss
+
+# Copy content directory
+COPY --from=dirbuilder /content /content
+
 # Expose port
 EXPOSE 8080
 

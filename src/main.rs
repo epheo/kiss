@@ -11,7 +11,7 @@ use kiss::get_mime_type_enum;
 
 const PORT: u16 = 8080;
 const MAX_REQUEST_SIZE: usize = 8192;
-const STATIC_DIR: &str = ".";
+const STATIC_DIR: &str = "./content";
 // MAX_FILE_SIZE removed - validation now happens during cache building only
 const CONNECTION_TIMEOUT_SECS: u64 = 30;
 const KEEPALIVE_TIMEOUT_SECS: u64 = 5;
