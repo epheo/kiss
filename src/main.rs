@@ -215,6 +215,25 @@ fn extract_header_value<'a>(line: &'a [u8], header_name: &[u8]) -> Option<&'a [u
     Some(&value_bytes[start..])
 }
 
+// High-performance query parameter stripping - zero allocations
+#[inline]
+fn strip_query_fast(path: &str) -> &str {
+    let bytes = path.as_bytes();
+    
+    // SIMD-friendly linear search for '?' character
+    for (i, &byte) in bytes.iter().enumerate() {
+        if byte == b'?' {
+            // SAFETY: We know the split point is at a valid UTF-8 boundary
+            // since '?' is a single ASCII byte
+            return unsafe { 
+                std::str::from_utf8_unchecked(&bytes[..i]) 
+            };
+        }
+    }
+    
+    path // No query parameters found
+}
+
 // Fast zero-allocation HTTP request line parser
 fn parse_request_line_fast(request: &[u8]) -> Option<(&[u8], &str, &str)> {
     let mut parts = request.split(|&b| b == b' ').filter(|part| !part.is_empty());
@@ -293,7 +312,7 @@ fn discover_files_recursive(
                 url_path.push('/');
                 url_path.push_str(&current_relative);
                 
-                // Pre-compute ALL path variations to eliminate runtime string ops
+                // Cache clean path only - query parameters will be stripped at runtime
                 cache.insert(url_path.clone(), file_metadata.clone());
                 
                 // Special handling for index.html - also serve it as root "/"
@@ -301,13 +320,7 @@ fn discover_files_recursive(
                     cache.insert("/".to_string(), file_metadata.clone());
                 }
                 
-                // Pre-compute common query parameter variations (eliminates runtime split('?'))
-                for common_query in &["", "?v=1", "?t=123", "?cache=false", "?_=123"] {
-                    let with_query = format!("{}{}", url_path, common_query);
-                    cache.insert(with_query, file_metadata.clone());
-                }
-                
-                // Pre-compute paths with trailing slashes
+                // Pre-compute paths with trailing slashes for directory-style requests
                 if url_path.len() > 1 && !url_path.ends_with('/') {
                     let with_slash = format!("{}/", url_path);
                     cache.insert(with_slash, file_metadata.clone());
@@ -611,16 +624,12 @@ async fn handle_request(
 
     // Inline static file serving for zero function call overhead
     
-    // Ultra-fast path lookup with pre-computed variations
+    // Ultra-fast path lookup with optimized query stripping
     let file_cache = FILE_CACHE.get().unwrap();
     
-    // Direct lookup with original path first (no string operations!)
-    let file_metadata = file_cache.get(path)
-        .or_else(|| {
-            // Fallback: only do string split if direct lookup fails
-            let clean_path = path.split('?').next().unwrap_or(path);
-            file_cache.get(clean_path)
-        });
+    // Always strip query parameters before cache lookup (zero allocations)
+    let clean_path = strip_query_fast(path);
+    let file_metadata = file_cache.get(clean_path);
 
     // Handle file from cache or 404
     if let Some(file_metadata) = file_metadata {
