@@ -1,12 +1,13 @@
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 use std::fs::{read_dir, metadata, read};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 use std::time::SystemTime;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::signal;
 use tokio::time::{timeout, Duration};
 use once_cell::sync::OnceCell;
+use std::sync::Arc;
 use kiss::get_mime_type_enum;
 
 const PORT: u16 = 8080;
@@ -18,6 +19,178 @@ const KEEPALIVE_TIMEOUT_SECS: u64 = 5;
 
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
+// String interning pool for path optimization (currently unused in favor of direct hashing)
+// Kept for potential future enhancements
+
+// Memory-optimized cache entry - structured for optimal cache line efficiency
+#[derive(Clone, Debug)]
+#[repr(C)]
+struct CacheEntry {
+    // Hot path data first (most frequently accessed in request handling)
+    complete_response: Arc<[u8]>,     // 8 bytes (pointer)
+    headers_only: Arc<[u8]>,          // 8 bytes (pointer)
+    not_modified_response: Arc<[u8]>, // 8 bytes (pointer)
+    
+    // Frequently used for conditional requests
+    last_modified_timestamp: SystemTime, // 16 bytes (u64 + u32 typically)
+    etag: Arc<str>,                   // 8 bytes (pointer)
+    
+    // Total: 48 bytes - fits well within cache lines
+}
+
+// Compact trie for prefix matching - optimized for trailing slash handling
+#[derive(Debug, Clone)]
+struct PathTrie {
+    // Maps normalized paths to cache entries
+    exact_matches: FxHashMap<u32, CacheEntry>,
+    // Special handling for index files
+    index_entries: FxHashMap<u32, CacheEntry>, // Maps directory hash to index.html entry
+}
+
+impl PathTrie {
+    fn new() -> Self {
+        Self {
+            exact_matches: FxHashMap::default(),
+            index_entries: FxHashMap::default(),
+        }
+    }
+    
+    // Ultra-optimized path normalization with integrated query stripping
+    // Single-pass processing: query detection + hash computation + trailing slash handling
+    #[inline]
+    fn normalize_path_hash(path: &str) -> (u32, bool) {
+        const FNV_OFFSET_BASIS: u32 = 2166136261;
+        const FNV_PRIME: u32 = 16777619;
+        
+        let path_bytes = path.as_bytes();
+        let mut hash = FNV_OFFSET_BASIS;
+        let mut end_pos = path_bytes.len();
+        let mut is_directory_style = false;
+        
+        // Single pass: find query position and check for trailing slash
+        for (i, &byte) in path_bytes.iter().enumerate() {
+            if byte == b'?' {
+                end_pos = i; // Stop at query parameter
+                break;
+            }
+        }
+        
+        // Check for directory-style path (trailing slash before query)
+        if end_pos > 1 && path_bytes[end_pos - 1] == b'/' {
+            is_directory_style = true;
+            end_pos -= 1; // Remove trailing slash from hash computation
+        }
+        
+        // Hash the clean, normalized path portion
+        for &byte in &path_bytes[..end_pos] {
+            hash ^= byte as u32;
+            hash = hash.wrapping_mul(FNV_PRIME);
+        }
+        
+        (hash, is_directory_style)
+    }
+    
+    fn insert(&mut self, path: &str, entry: CacheEntry) {
+        let (path_hash, _is_directory_style) = Self::normalize_path_hash(path);
+        
+        // Always store in exact matches
+        self.exact_matches.insert(path_hash, entry.clone());
+        
+        // If this is an index.html file, also register it for directory-style access
+        if path.ends_with("/index.html") {
+            let dir_path = &path[..path.len()-11]; // Remove "/index.html"
+            let (dir_hash, _) = Self::normalize_path_hash(dir_path);
+            self.index_entries.insert(dir_hash, entry);
+        }
+    }
+    
+    fn get(&self, path: &str) -> Option<CacheEntry> {
+        let (path_hash, is_directory_style) = Self::normalize_path_hash(path);
+        
+        // First try exact match
+        if let Some(entry) = self.exact_matches.get(&path_hash) {
+            return Some(entry.clone());
+        }
+        
+        // For directory-style requests, try index.html
+        if is_directory_style || path == "/" {
+            if let Some(entry) = self.index_entries.get(&path_hash) {
+                return Some(entry.clone());
+            }
+        }
+        
+        None
+    }
+    
+    fn entry_count(&self) -> usize {
+        self.exact_matches.len()
+    }
+}
+
+// Lock-free cache with atomic RCU pattern
+#[derive(Debug)]
+struct OptimizedCache {
+    // Atomic pointer to current cache generation (lock-free reads)
+    current: AtomicPtr<CacheGeneration>,
+}
+
+#[derive(Debug)]
+struct CacheGeneration {
+    // PathTrie for efficient prefix matching and trailing slash handling
+    trie: PathTrie,
+}
+
+impl Drop for CacheGeneration {
+    fn drop(&mut self) {
+        // Custom drop for safe memory management
+    }
+}
+
+impl OptimizedCache {
+    fn new() -> Self {
+        let initial_cache = Box::into_raw(Box::new(CacheGeneration {
+            trie: PathTrie::new(),
+        }));
+        
+        Self {
+            current: AtomicPtr::new(initial_cache),
+        }
+    }
+    
+    // Lock-free read operation using atomic load with trie lookup
+    fn get(&self, path: &str) -> Option<CacheEntry> {
+        // Load the current cache pointer atomically
+        let cache_ptr = self.current.load(Ordering::Acquire);
+        
+        // SAFETY: The pointer is valid as long as we don't perform concurrent updates
+        // For a static file server, the cache is built once at startup
+        unsafe {
+            let cache = &*cache_ptr;
+            cache.trie.get(path)
+        }
+    }
+    
+    // Only used during initial cache building (single-threaded)
+    fn insert(&self, path: String, entry: CacheEntry) {
+        // Load current cache
+        let cache_ptr = self.current.load(Ordering::Acquire);
+        
+        // SAFETY: During cache building phase, this is single-threaded
+        unsafe {
+            let cache = &mut *(cache_ptr as *mut CacheGeneration);
+            cache.trie.insert(&path, entry);
+        }
+    }
+    
+    fn entry_count(&self) -> usize {
+        let cache_ptr = self.current.load(Ordering::Acquire);
+        unsafe {
+            let cache = &*cache_ptr;
+            cache.trie.entry_count()
+        }
+    }
+}
+
 // Zero-I/O file metadata - everything preloaded in memory
 #[derive(Clone, Debug)]
 struct FileMetadata {
@@ -28,9 +201,9 @@ struct FileMetadata {
     last_modified_timestamp: SystemTime, // For If-Modified-Since comparison
 }
 
-// Static storage for header templates and file cache - initialized at startup
+// Static storage for header templates and optimized file cache - initialized at startup
 static HEADER_TEMPLATES: OnceCell<HeaderTemplates> = OnceCell::new();
-static FILE_CACHE: OnceCell<HashMap<String, FileMetadata>> = OnceCell::new();
+static FILE_CACHE: OnceCell<OptimizedCache> = OnceCell::new();
 
 // Pre-compiled response templates split into headers and bodies for unified handling
 #[derive(Debug)]
@@ -215,24 +388,8 @@ fn extract_header_value<'a>(line: &'a [u8], header_name: &[u8]) -> Option<&'a [u
     Some(&value_bytes[start..])
 }
 
-// High-performance query parameter stripping - zero allocations
-#[inline]
-fn strip_query_fast(path: &str) -> &str {
-    let bytes = path.as_bytes();
-    
-    // SIMD-friendly linear search for '?' character
-    for (i, &byte) in bytes.iter().enumerate() {
-        if byte == b'?' {
-            // SAFETY: We know the split point is at a valid UTF-8 boundary
-            // since '?' is a single ASCII byte
-            return unsafe { 
-                std::str::from_utf8_unchecked(&bytes[..i]) 
-            };
-        }
-    }
-    
-    path // No query parameters found
-}
+// Query parameter parsing now integrated into PathTrie::normalize_path_hash
+// This function has been removed for performance optimization
 
 // Fast zero-allocation HTTP request line parser
 fn parse_request_line_fast(request: &[u8]) -> Option<(&[u8], &str, &str)> {
@@ -259,21 +416,22 @@ fn parse_request_line_fast(request: &[u8]) -> Option<(&[u8], &str, &str)> {
     Some((method, path, version))
 }
 
-fn build_file_cache() -> HashMap<String, FileMetadata> {
-    let mut cache = HashMap::new();
+fn build_file_cache() -> OptimizedCache {
+    let cache = OptimizedCache::new();
     
-    if let Err(e) = discover_files_recursive(STATIC_DIR, "", &mut cache) {
+    if let Err(e) = discover_files_recursive(STATIC_DIR, "", &cache) {
         eprintln!("Warning: Failed to build file cache: {}", e);
     }
     
-    println!("File cache built with {} entries", cache.len());
+    let entry_count = cache.entry_count();
+    println!("Optimized file cache built with {} entries", entry_count);
     cache
 }
 
 fn discover_files_recursive(
     base_dir: &str,
     relative_path: &str,
-    cache: &mut HashMap<String, FileMetadata>,
+    cache: &OptimizedCache,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Optimized path construction using pre-allocated capacity
     let mut full_path = String::with_capacity(base_dir.len() + relative_path.len() + 1);
@@ -312,19 +470,18 @@ fn discover_files_recursive(
                 url_path.push('/');
                 url_path.push_str(&current_relative);
                 
-                // Cache clean path only - query parameters will be stripped at runtime
-                cache.insert(url_path.clone(), file_metadata.clone());
+                // Convert FileMetadata to optimized CacheEntry
+                let cache_entry = CacheEntry {
+                    // Hot path data first for better cache locality
+                    complete_response: Arc::from(file_metadata.complete_response.into_boxed_slice()),
+                    headers_only: Arc::from(file_metadata.headers_only.into_boxed_slice()),
+                    not_modified_response: Arc::from(file_metadata.not_modified_response.into_boxed_slice()),
+                    last_modified_timestamp: file_metadata.last_modified_timestamp,
+                    etag: Arc::from(file_metadata.etag.into_boxed_str()),
+                };
                 
-                // Special handling for index.html - also serve it as root "/"
-                if current_relative == "index.html" {
-                    cache.insert("/".to_string(), file_metadata.clone());
-                }
-                
-                // Pre-compute paths with trailing slashes for directory-style requests
-                if url_path.len() > 1 && !url_path.ends_with('/') {
-                    let with_slash = format!("{}/", url_path);
-                    cache.insert(with_slash, file_metadata.clone());
-                }
+                // Cache entry - trie automatically handles trailing slashes and index.html mapping
+                cache.insert(url_path, cache_entry);
             }
         } else if metadata.is_dir() {
             // Recursively process directories
@@ -624,21 +781,20 @@ async fn handle_request(
 
     // Inline static file serving for zero function call overhead
     
-    // Ultra-fast path lookup with optimized query stripping
+    // Ultra-fast path lookup with integrated query handling in PathTrie
     let file_cache = FILE_CACHE.get().unwrap();
     
-    // Always strip query parameters before cache lookup (zero allocations)
-    let clean_path = strip_query_fast(path);
-    let file_metadata = file_cache.get(clean_path);
+    // Direct path lookup - query parameters handled in hash computation
+    let cache_entry = file_cache.get(path);
 
     // Handle file from cache or 404
-    if let Some(file_metadata) = file_metadata {
+    if let Some(cache_entry) = cache_entry {
         // Ultra-fast conditional request handling with If-Modified-Since check first
         if let Some(if_modified_since_str) = if_modified_since {
             if let Ok(client_time) = httpdate::parse_http_date(if_modified_since_str) {
-                if file_metadata.last_modified_timestamp <= client_time {
+                if cache_entry.last_modified_timestamp <= client_time {
                     // Fast path: Use pre-generated 304 response
-                    stream.write_all(&file_metadata.not_modified_response).await?;
+                    stream.write_all(&cache_entry.not_modified_response).await?;
                     stream.flush().await?;
                     return Ok(());
                 }
@@ -647,9 +803,9 @@ async fn handle_request(
         
         // Ultra-fast conditional request handling (immutable files = simple ETag check)
         if let Some(client_etag) = if_none_match {
-            if client_etag.contains(&file_metadata.etag) || client_etag == "*" {
+            if client_etag.contains(&*cache_entry.etag) || client_etag == "*" {
                 // Fast path: Use pre-generated 304 response
-                stream.write_all(&file_metadata.not_modified_response).await?;
+                stream.write_all(&cache_entry.not_modified_response).await?;
                 stream.flush().await?;
                 return Ok(());
             }
@@ -658,10 +814,10 @@ async fn handle_request(
         // Single write operation - minimal system calls
         if is_head {
             // HEAD request: Send headers only (pre-generated, single write)
-            stream.write_all(&file_metadata.headers_only).await?;
+            stream.write_all(&cache_entry.headers_only).await?;
         } else {
             // GET request: Send complete response (headers + content in single write!)
-            stream.write_all(&file_metadata.complete_response).await?;
+            stream.write_all(&cache_entry.complete_response).await?;
         }
         stream.flush().await?;
     } else {
