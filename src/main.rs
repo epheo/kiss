@@ -13,14 +13,10 @@ use kiss::get_mime_type_enum;
 const PORT: u16 = 8080;
 const MAX_REQUEST_SIZE: usize = 8192;
 const STATIC_DIR: &str = "./content";
-// MAX_FILE_SIZE removed - validation now happens during cache building only
 const CONNECTION_TIMEOUT_SECS: u64 = 30;
 const KEEPALIVE_TIMEOUT_SECS: u64 = 5;
 
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
-
-// String interning pool for path optimization (currently unused in favor of direct hashing)
-// Kept for potential future enhancements
 
 // Memory-optimized cache entry - structured for optimal cache line efficiency
 #[derive(Clone, Debug)]
@@ -55,7 +51,7 @@ impl PathTrie {
         }
     }
     
-    // Ultra-optimized path normalization with integrated query stripping
+    // Optimized path normalization with integrated query stripping
     // Single-pass processing: query detection + hash computation + trailing slash handling
     #[inline]
     fn normalize_path_hash(path: &str) -> (u32, bool) {
@@ -138,12 +134,6 @@ struct OptimizedCache {
 struct CacheGeneration {
     // PathTrie for efficient prefix matching and trailing slash handling
     trie: PathTrie,
-}
-
-impl Drop for CacheGeneration {
-    fn drop(&mut self) {
-        // Custom drop for safe memory management
-    }
 }
 
 impl OptimizedCache {
@@ -387,9 +377,6 @@ fn extract_header_value<'a>(line: &'a [u8], header_name: &[u8]) -> Option<&'a [u
     
     Some(&value_bytes[start..])
 }
-
-// Query parameter parsing now integrated into PathTrie::normalize_path_hash
-// This function has been removed for performance optimization
 
 // Fast zero-allocation HTTP request line parser
 fn parse_request_line_fast(request: &[u8]) -> Option<(&[u8], &str, &str)> {
@@ -695,7 +682,7 @@ async fn handle_connection_inner(stream: &mut TcpStream) -> Result<(), Box<dyn s
         let mut if_modified_since: Option<&[u8]> = None;
         let mut if_none_match: Option<&[u8]> = None;
         
-        // Ultra-optimized header parsing with zero allocations
+        // Optimized header parsing with zero allocations
         loop {
             header_buffer.clear(); // Reuse vec, just clear content
             
@@ -795,7 +782,7 @@ async fn handle_request(
 
     // Inline static file serving for zero function call overhead
     
-    // Ultra-fast path lookup with integrated query handling in PathTrie
+    // Fast path lookup with integrated query handling in PathTrie
     let file_cache = FILE_CACHE.get().unwrap();
     
     // Direct path lookup - query parameters handled in hash computation
@@ -803,7 +790,7 @@ async fn handle_request(
 
     // Handle file from cache or 404
     if let Some(cache_entry) = cache_entry {
-        // Ultra-fast conditional request handling with If-Modified-Since check first
+        // Fast conditional request handling with If-Modified-Since check first
         if let Some(if_modified_since_bytes) = if_modified_since {
             // Convert bytes to string only when needed for parsing
             if let Ok(if_modified_since_str) = std::str::from_utf8(if_modified_since_bytes) {
@@ -818,7 +805,7 @@ async fn handle_request(
             }
         }
         
-        // Ultra-fast conditional request handling (immutable files = simple ETag check)
+        // Fast conditional request handling (immutable files = simple ETag check)
         if let Some(client_etag_bytes) = if_none_match {
             // Perform direct byte comparison for ETag matching
             let etag_bytes = cache_entry.etag.as_bytes();
