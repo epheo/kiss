@@ -1,6 +1,6 @@
 # HTTP Headers Implementation
 
-KISS implements comprehensive HTTP caching headers with file metadata caching for optimal performance.
+KISS implements comprehensive HTTP caching headers with file-caching architecture for optimal performance.
 
 ## File Header Caching
 
@@ -13,12 +13,12 @@ KISS implements comprehensive HTTP caching headers with file metadata caching fo
   - `ETag` (weak format: `W/"size-mtime"`)
   - `Last-Modified` (timestamp format)
   - `Cache-Control: public, max-age=3600`
-  - Security headers (CSP, X-Frame-Options, etc.)
+  - Security headers (X-Content-Type-Options)
 
 ### Performance Benefits
 - **Zero filesystem metadata calls** during request handling
 - **Pre-compiled headers** eliminate string formatting overhead
-- **O(1) cache lookups** via HashMap for instant header retrieval
+- **O(1) cache lookups** via FxHashMap with hash-based path resolution for instant header retrieval
 - **304 Not Modified** support reduces bandwidth usage
 
 ## Conditional Request Support
@@ -41,22 +41,24 @@ KISS implements comprehensive HTTP caching headers with file metadata caching fo
 
 ## Security Headers
 
-All responses include comprehensive security headers:
+All responses include security headers:
 - `X-Content-Type-Options: nosniff`
-- `X-Frame-Options: DENY` 
-- `Content-Security-Policy: default-src 'self'; ...`
 
 ## Implementation Details
 
 ### Cache Structure
 ```rust
-HashMap<String, FileMetadata> {
-    "/index.html" -> FileMetadata {
-        headers: "HTTP/1.1 200 OK\r\n...",
-        size: 1234,
-        last_modified: SystemTime,
-        etag: "W/\"1234-1445412480\"",
-    }
+PathTrie {
+    exact_matches: FxHashMap<u32, CacheEntry>,
+    index_entries: FxHashMap<u32, CacheEntry>,
+}
+
+CacheEntry {
+    complete_response: Arc<[u8]>,     // Headers + content combined
+    headers_only: Arc<[u8]>,          // Headers for HEAD requests
+    not_modified_response: Arc<[u8]>, // Pre-generated 304 response
+    last_modified_timestamp: SystemTime,
+    etag: Arc<str>,
 }
 ```
 
@@ -82,4 +84,4 @@ Comprehensive test suite covers:
 
 - **Cache Control**: 1 hour max-age (`max-age=3600`)
 - **ETag Format**: Weak ETags for compatibility
-- **Security Policy**: Restrictive CSP with selective allowances for web assets
+- **Security Policy**: Content-Type protection via X-Content-Type-Options header

@@ -1,13 +1,13 @@
 # KISS Instant Static Server
 
-KISS (Kubernetes Instant Static Server) is an in-memory static file server written in Rust, designed as a minimalistic base image for Kubernetes deployments.
+KISS (Kubernetes Instant Static Server) is a high-performance static file server written in Rust, designed as a minimalistic base image for Kubernetes deployments.
 
 ## Overview
 
-KISS implements an in-memory architecture that pre-loads static files at startup, eliminating disk I/O during request processing. This approach is designed for static websites, single-page applications, and documentation in containerized environments.
+KISS implements a file-caching architecture that pre-loads static files at startup into memory, eliminating disk I/O during request processing. This approach is designed for static websites, single-page applications, and documentation in containerized environments.
 
 **Characteristics:**
-- In-memory file serving with zero disk I/O during requests
+- Cached file serving with zero disk I/O during requests
 - Single-purpose design focused on static content delivery
 - Container-optimized for Kubernetes deployments
 - Minimal dependencies and attack surface
@@ -33,14 +33,14 @@ This division follows cloud-native principles where each component has a single 
 
 ## What KISS do implement
 
-- Ultra-low latency: Direct TCP + zero-copy responses
+- Ultra-low latency: Async TCP with zero-copy responses
 - Minimal memory footprint: Lock-free cache, pre-compiled responses
 - Zero I/O overhead: Complete file preloading at startup
 - Optimized request parsing: Single-pass HTTP parsing with FNV hashing
 - Single-write responses: Headers + content combined
-- CPU efficiency: No framework overhead, minimal allocations
+- CPU efficiency: Async Tokio runtime, minimal allocations
 - Predictable performance (no GC, minimal branching)
-- Container optimized (scratch image, few kb)
+- Container optimized (scratch image, minimal size)
 
 ## Usage
 
@@ -85,7 +85,7 @@ RUN sphinx-build -b html . _build/html
 
 # Serve with KISS
 FROM quay.io/epheo/kiss:latest
-COPY --from=builder /docs/_build/html/ /
+COPY --from=builder /docs/_build/html/ /content/
 ```
 
 Your documentation project:
@@ -183,7 +183,7 @@ spec:
         fsGroup: 65534
       containers:
       - name: kiss
-        image: kiss:latest
+        image: quay.io/epheo/kiss:latest
         ports:
         - containerPort: 8080
         securityContext:
@@ -202,7 +202,7 @@ spec:
             port: 8080
         volumeMounts:
         - name: static-files
-          mountPath: /app/static
+          mountPath: /content
           readOnly: true
       volumes:
       - name: static-files
@@ -236,7 +236,7 @@ spec:
     spec:
       containers:
       - name: kiss
-        image: kiss:latest
+        image: quay.io/epheo/kiss:latest
         ports:
         - containerPort: 8080
         securityContext:
@@ -269,9 +269,9 @@ KISS is designed with security as a primary concern:
 
 ### Container Security
 - **Scratch Base Image**: Minimal attack surface with no OS packages, shell, or utilities
-- **Static Binary**: Single Rust binary (562KB) with no runtime dependencies
-- **Ultra-Lightweight Container**: 706KB total container size
-- **Rootless Operation**: Runs as non-privileged user on both Kubernetes and OpenShift
+- **Static Binary**: Single Rust binary (542KB) with no runtime dependencies
+- **Ultra-Lightweight Container**: 692KB total container size optimized for security
+- **Rootless Operation**: Designed for non-privileged execution on both Kubernetes and OpenShift
 - **Read-Only Filesystem**: Compatible with `readOnlyRootFilesystem: true`
 - **No Privilege Escalation**: Designed to run with `allowPrivilegeEscalation: false`
 - **Minimal Capabilities**: Functions with all Linux capabilities dropped
@@ -291,11 +291,11 @@ KISS is designed with security as a primary concern:
 
 ## Performance Architecture
 
-KISS implements an in-memory architecture that pre-loads all static files and pre-generates complete HTTP responses at startup, eliminating disk I/O during request processing.
+KISS implements a file-caching architecture that pre-loads all static files and pre-generates complete HTTP responses at startup, eliminating disk I/O during request processing.
 
 ### Architecture Overview
 
-At startup, KISS scans the static directory and builds an in-memory cache containing:
+At startup, KISS scans the static directory and builds a file cache containing:
 - **Complete HTTP responses**: Pre-generated headers and content combined for single-write operations
 - **File content**: All files loaded entirely into memory
 - **Conditional responses**: Pre-computed 304 Not Modified responses
@@ -304,10 +304,10 @@ At startup, KISS scans the static directory and builds an in-memory cache contai
 ### Performance Characteristics
 
 **Performance Characteristics:**
-- Small files (< 1KB): 198,000 requests/second
-- Medium files (100KB): 61,000 requests/second  
-- Response times: 0.5-1.6ms for files under 1MB
+- Based on benchmark testing (see `docs/PERFORMANCES.md` for detailed results)
+- Optimized for small to medium files (< 1MB)
 - Zero disk I/O during request serving
+- Consistently low response times
 
 **Implementation Details:**
 - Single write() system call per request
@@ -317,7 +317,7 @@ At startup, KISS scans the static directory and builds an in-memory cache contai
 
 ### Security Considerations
 
-The in-memory architecture provides certain security characteristics:
+The file-caching architecture provides certain security characteristics:
 - Only files present at startup can be served
 - Cache-based lookups help prevent directory traversal attempts
 - No dynamic file system access during request handling
@@ -340,9 +340,9 @@ This architecture aligns with container deployment patterns:
 
 **Limitations:**
 - Memory usage scales with total content size
-- Performance optimized for files under 1MB
+- Optimized for files under 1MB
 - Content is immutable during runtime (requires container restart for changes)
 - Startup time correlates with file count and total size
 
-For detailed performance analysis, see `docs/PERFORMANCES.md`.
+For detailed performance analysis and benchmark results, see `docs/PERFORMANCES.md`.
 
