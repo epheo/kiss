@@ -1,3 +1,4 @@
+use clap::Parser;
 use rustc_hash::FxHashMap;
 use std::fs::{read_dir, metadata, read};
 use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
@@ -10,11 +11,34 @@ use once_cell::sync::OnceCell;
 use std::sync::Arc;
 use kiss::get_mime_type_enum;
 
-const PORT: u16 = 8080;
-const MAX_REQUEST_SIZE: usize = 8192;
-const STATIC_DIR: &str = "./content";
-const CONNECTION_TIMEOUT_SECS: u64 = 30;
-const KEEPALIVE_TIMEOUT_SECS: u64 = 5;
+/// KISS (Kubernetes Instant Static Server) - A fast static file server
+#[derive(Parser)]
+#[command(author, version, about, long_about = None)]
+struct Config {
+    /// Port to bind the server to
+    #[arg(short, long, default_value_t = 8080, value_parser = clap::value_parser!(u16).range(1..=65535))]
+    port: u16,
+
+    /// Maximum size of incoming requests in bytes
+    #[arg(short = 'r', long, default_value_t = 8192)]
+    max_request_size: usize,
+
+    /// Directory to serve static files from
+    #[arg(short = 's', long, default_value = "./content")]
+    static_dir: String,
+
+    /// Connection timeout in seconds
+    #[arg(short = 'c', long, default_value_t = 30)]
+    connection_timeout_secs: u64,
+
+    /// Keep-alive timeout in seconds
+    #[arg(short = 'k', long, default_value_t = 5)]
+    keepalive_timeout_secs: u64,
+
+    /// IP address to bind the server to
+    #[arg(short = 'b', long, default_value = "0.0.0.0")]
+    bind_ip: String,
+}
 
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
@@ -403,10 +427,10 @@ fn parse_request_line_fast(request: &[u8]) -> Option<(&[u8], &str, &str)> {
     Some((method, path, version))
 }
 
-fn build_file_cache() -> OptimizedCache {
+fn build_file_cache(static_dir: &str) -> OptimizedCache {
     let cache = OptimizedCache::new();
     
-    if let Err(e) = discover_files_recursive(STATIC_DIR, "", &cache) {
+    if let Err(e) = discover_files_recursive(static_dir, "", &cache) {
         eprintln!("Warning: Failed to build file cache: {}", e);
     }
     
@@ -544,19 +568,41 @@ fn generate_file_metadata(file_path: &std::path::Path, _relative_path: &str) -> 
 
 #[tokio::main]
 async fn main() {
+    // Parse command line arguments - pay overhead only once here
+    let config = Config::parse();
+    
+    // Extract values once at startup - zero runtime overhead thereafter
+    let port = config.port;
+    let max_request_size = config.max_request_size;
+    let static_dir = config.static_dir;
+    let connection_timeout_secs = config.connection_timeout_secs;
+    let keepalive_timeout_secs = config.keepalive_timeout_secs;
+    let bind_ip = config.bind_ip;
+    
     // Initialize header templates and file cache at startup - not on first request
     HEADER_TEMPLATES.set(HeaderTemplates::new())
         .expect("Failed to initialize header templates");
     
-    let cache = build_file_cache();
+    let cache = build_file_cache(&static_dir);
     FILE_CACHE.set(cache)
         .expect("Failed to initialize file cache");
 
-    let listener = TcpListener::bind(format!("0.0.0.0:{}", PORT))
+    // Run server with direct config values - true zero overhead
+    run_server(bind_ip, port, max_request_size, connection_timeout_secs, keepalive_timeout_secs).await;
+}
+
+async fn run_server(
+    bind_ip: String,
+    port: u16,
+    max_request_size: usize,
+    connection_timeout_secs: u64,
+    keepalive_timeout_secs: u64,
+) {
+    let listener = TcpListener::bind(format!("{}:{}", bind_ip, port))
         .await
         .expect("Failed to bind to address");
 
-    println!("Async KISS server running on http://0.0.0.0:{}", PORT);
+    println!("Async KISS server running on http://{}:{}", bind_ip, port);
 
     loop {
         tokio::select! {
@@ -565,7 +611,12 @@ async fn main() {
                     Ok((stream, _)) => {
                         // Configure TCP socket for performance
                         let _ = stream.set_nodelay(true);
-                        tokio::spawn(handle_connection(stream));
+                        tokio::spawn(handle_connection(
+                            stream,
+                            max_request_size,
+                            connection_timeout_secs,
+                            keepalive_timeout_secs,
+                        ));
                     }
                     Err(_) => continue,
                 }
@@ -605,11 +656,16 @@ async fn shutdown_signal() {
     }
 }
 
-async fn handle_connection(mut stream: TcpStream) {
-    // Set connection timeout
+async fn handle_connection(
+    mut stream: TcpStream,
+    max_request_size: usize,
+    connection_timeout_secs: u64,
+    keepalive_timeout_secs: u64,
+) {
+    // Set connection timeout - direct value, zero overhead
     let connection_result = timeout(
-        Duration::from_secs(CONNECTION_TIMEOUT_SECS),
-        handle_connection_inner(&mut stream),
+        Duration::from_secs(connection_timeout_secs),
+        handle_connection_inner(&mut stream, max_request_size, keepalive_timeout_secs),
     )
     .await;
 
@@ -619,7 +675,11 @@ async fn handle_connection(mut stream: TcpStream) {
     }
 }
 
-async fn handle_connection_inner(stream: &mut TcpStream) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn handle_connection_inner(
+    stream: &mut TcpStream,
+    max_request_size: usize,
+    keepalive_timeout_secs: u64,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Pre-allocate buffers once per connection (not per request)
     let mut request_line = String::with_capacity(512);
     let mut header_buffer = Vec::with_capacity(1024);
@@ -641,16 +701,16 @@ async fn handle_connection_inner(stream: &mut TcpStream) -> Result<(), Box<dyn s
         // Create fresh BufReader per request - optimal for brief line reading
         let mut reader = BufReader::new(&mut *stream);
 
-        // Read request line with timeout
+        // Read request line with timeout - direct value, zero overhead
         match timeout(
-            Duration::from_secs(KEEPALIVE_TIMEOUT_SECS),
+            Duration::from_secs(keepalive_timeout_secs),
             reader.read_line(&mut request_line),
         )
         .await
         {
             Ok(Ok(0)) | Err(_) => break, // Connection closed or timeout
             Ok(Err(_)) => break,         // Read error
-            Ok(Ok(size)) if size > MAX_REQUEST_SIZE => {
+            Ok(Ok(size)) if size > max_request_size => {
                 send_precompiled_response(stream, &HEADER_TEMPLATES.get().unwrap().request_too_large).await?;
                 break;
             }

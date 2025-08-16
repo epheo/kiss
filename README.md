@@ -1,5 +1,7 @@
 # KISS Instant Static Server
 
+[![Container Repository on Quay](https://quay.io/repository/epheo/kiss/status "Container Repository on Quay")](https://quay.io/repository/epheo/kiss)
+
 KISS (Kubernetes Instant Static Server) is a high-performance static file server written in Rust, designed as a minimalistic base image for Kubernetes deployments.
 
 ## Overview
