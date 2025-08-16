@@ -633,9 +633,11 @@ async fn handle_connection(mut stream: TcpStream) {
 }
 
 async fn handle_connection_inner(stream: &mut TcpStream) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Reusable buffers to eliminate per-request allocations
-    let mut request_line = String::with_capacity(128);
-    let mut header_buffer = Vec::with_capacity(256);
+    // Pre-allocate buffers once per connection (not per request)
+    let mut request_line = String::with_capacity(512);
+    let mut header_buffer = Vec::with_capacity(1024);
+    let mut if_modified_since_buf = Vec::with_capacity(256);
+    let mut if_none_match_buf = Vec::with_capacity(256);
     
     loop {
         // Check for shutdown
@@ -643,9 +645,14 @@ async fn handle_connection_inner(stream: &mut TcpStream) -> Result<(), Box<dyn s
             break;
         }
 
+        // Clear buffers for reuse (eliminate per-request allocations)
+        request_line.clear();
+        header_buffer.clear();
+        if_modified_since_buf.clear();
+        if_none_match_buf.clear();
+
         // Create fresh BufReader per request - optimal for brief line reading
         let mut reader = BufReader::new(&mut *stream);
-        request_line.clear(); // Reuse string, just clear content
 
         // Read request line with timeout
         match timeout(
@@ -685,8 +692,8 @@ async fn handle_connection_inner(stream: &mut TcpStream) -> Result<(), Box<dyn s
 
         // Enhanced connection management - faster header parsing
         let mut keep_alive = version == "HTTP/1.1"; // Default for HTTP/1.1
-        let mut if_modified_since: Option<Vec<u8>> = None;
-        let mut if_none_match: Option<Vec<u8>> = None;
+        let mut if_modified_since: Option<&[u8]> = None;
+        let mut if_none_match: Option<&[u8]> = None;
         
         // Ultra-optimized header parsing with zero allocations
         loop {
@@ -712,11 +719,15 @@ async fn handle_connection_inner(stream: &mut TcpStream) -> Result<(), Box<dyn s
                         keep_alive = !connection_close_requested && (version == "HTTP/1.1" || header_contains(line, b"keep-alive"));
                     } else if header_starts_with(line, b"if-modified-since:") {
                         if let Some(value) = extract_header_value(line, b"if-modified-since:") {
-                            if_modified_since = Some(value.to_vec());
+                            if_modified_since_buf.clear();
+                            if_modified_since_buf.extend_from_slice(value);
+                            if_modified_since = Some(&if_modified_since_buf);
                         }
                     } else if header_starts_with(line, b"if-none-match:") {
                         if let Some(value) = extract_header_value(line, b"if-none-match:") {
-                            if_none_match = Some(value.to_vec());
+                            if_none_match_buf.clear();
+                            if_none_match_buf.extend_from_slice(value);
+                            if_none_match = Some(&if_none_match_buf);
                         }
                     }
                 }
@@ -728,7 +739,7 @@ async fn handle_connection_inner(stream: &mut TcpStream) -> Result<(), Box<dyn s
         let is_head = method == b"HEAD";
         
         // Direct stream usage for optimal response performance
-        match handle_request(stream, path, is_head, if_modified_since.as_deref(), if_none_match.as_deref()).await {
+        match handle_request(stream, path, is_head, if_modified_since, if_none_match).await {
             Ok(_) => {
                 if !keep_alive {
                     break;
