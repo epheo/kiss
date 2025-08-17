@@ -2,17 +2,20 @@
 
 [![Container Repository on Quay](https://quay.io/repository/epheo/kiss/status "Container Repository on Quay")](https://quay.io/repository/epheo/kiss)
 
-KISS (Kubernetes Instant Static Server) is a high-performance static file server written in Rust, designed as a minimalistic base image for Kubernetes deployments.
+KISS (Kubernetes Instant Static Server) is a high-performance async static file server written in Rust, designed as a minimalistic base image for Kubernetes deployments with zero-overhead configuration.
 
 ## Overview
 
-KISS implements a file-caching architecture that pre-loads static files at startup into memory, eliminating disk I/O during request processing. This approach is designed for static websites, single-page applications, and documentation in containerized environments.
+KISS implements an advanced lock-free caching architecture with pre-generated responses, eliminating disk I/O and memory allocations during request processing. This approach is designed for static websites, single-page applications, and documentation in containerized environments.
 
 **Characteristics:**
-- Cached file serving with zero disk I/O during requests
-- Single-purpose design focused on static content delivery
-- Container-optimized for Kubernetes deployments
-- Minimal dependencies and attack surface
+- **Lock-free file caching** with zero disk I/O during requests  
+- **Zero-allocation hot paths** with pre-allocated buffer reuse
+- **Async Tokio runtime** with per-connection task spawning
+- **CLI/Environment configuration** with zero runtime overhead
+- **Single-purpose design** focused on maximum performance static content delivery
+- **Container-optimized** for Kubernetes deployments
+- **Minimal dependencies** and attack surface
 
 KISS serves files from the container content directory (`/content/`) while protecting the server binary at `/kiss`.
 
@@ -33,16 +36,18 @@ The following features are deliberately omitted from KISS because they are handl
 
 This division follows cloud-native principles where each component has a single responsibility, reducing complexity and attack surface.
 
-## What KISS do implement
+## What KISS implements
 
-- Ultra-low latency: Async TCP with zero-copy responses
-- Minimal memory footprint: Lock-free cache, pre-compiled responses
-- Zero I/O overhead: Complete file preloading at startup
-- Optimized request parsing: Single-pass HTTP parsing with FNV hashing
-- Single-write responses: Headers + content combined
-- CPU efficiency: Async Tokio runtime, minimal allocations
-- Predictable performance (no GC, minimal branching)
-- Container optimized (scratch image, minimal size)
+- **GET/HEAD**: Well; This is static file server
+- **Ultra-low latency**: Async Tokio with zero-copy responses and lock-free caching
+- **Memory-optimized**: Cache-line efficient structs, pre-allocated buffers, Arc-based sharing
+- **Zero I/O overhead**: Complete file preloading at startup with pre-generated responses
+- **Algorithmic efficiency**: FNV hashing, single-pass processing, Boyer-Moore-like matching
+- **Single-write responses**: Headers + content combined for minimal syscalls
+- **Lock-free concurrency**: Atomic RCU pattern for cache access without contention
+- **Zero-allocation hot paths**: Buffer reuse, direct byte manipulation
+- **Predictable performance**: No GC, minimal branching, cache-friendly access patterns
+- **Container optimized**: Scratch image, configurable via CLI/environment variables
 
 ## Usage
 
@@ -106,7 +111,7 @@ podman build -t my-docs .
 podman run -p 8080:8080 --read-only my-docs
 ```
 
-**Kubernetes Deployment:**
+**Kubernetes Deployment with Configuration:**
 ```yaml
 apiVersion: apps/v1
 kind: Deployment
@@ -131,6 +136,17 @@ spec:
         image: my-website:latest  # Your custom image
         ports:
         - containerPort: 8080
+        env:
+        - name: KISS_PORT
+          value: "8080"
+        - name: KISS_BIND_IP
+          value: "0.0.0.0"
+        - name: KISS_MAX_REQUEST_SIZE
+          value: "16384"        # 16KB for larger requests
+        - name: KISS_CONNECTION_TIMEOUT
+          value: "60"           # 60 seconds for slower clients
+        - name: KISS_KEEPALIVE_TIMEOUT
+          value: "10"           # 10 seconds keep-alive
         securityContext:
           allowPrivilegeEscalation: false
           readOnlyRootFilesystem: true
@@ -145,6 +161,45 @@ spec:
             path: /ready
             port: 8080
 ```
+
+### Configuration
+
+KISS supports flexible configuration via CLI arguments or environment variables with zero runtime overhead:
+
+| Setting | CLI Flag | Environment Variable | Default | Description |
+|---------|----------|---------------------|---------|-------------|
+| Port | `--port` `-p` | `KISS_PORT` | `8080` | Server bind port |
+| Bind IP | `--bind-ip` `-b` | `KISS_BIND_IP` | `"0.0.0.0"` | IP address to bind |
+| Static Directory | `--static-dir` `-s` | `KISS_STATIC_DIR` | `"./content"` | Static files directory |
+| Max Request Size | `--max-request-size` `-r` | `KISS_MAX_REQUEST_SIZE` | `8192` | Request size limit (bytes) |
+| Connection Timeout | `--connection-timeout-secs` `-c` | `KISS_CONNECTION_TIMEOUT` | `30` | Connection timeout (seconds) |
+| Keep-alive Timeout | `--keepalive-timeout-secs` `-k` | `KISS_KEEPALIVE_TIMEOUT` | `5` | Keep-alive timeout (seconds) |
+
+**Configuration Examples:**
+
+Using CLI arguments:
+```bash
+./kiss --port 9000 --bind-ip 127.0.0.1 --max-request-size 16384
+```
+
+Using environment variables (preferred for containers):
+```bash
+export KISS_PORT=9000
+export KISS_BIND_IP=127.0.0.1
+export KISS_MAX_REQUEST_SIZE=16384
+./kiss
+```
+
+Docker with environment variables:
+```bash
+podman run -p 9000:9000 \
+  -e KISS_PORT=9000 \
+  -e KISS_BIND_IP=0.0.0.0 \
+  -e KISS_STATIC_DIR=/content \
+  --read-only my-website
+```
+
+**Priority Order:** CLI arguments > Environment variables > Default values
 
 ### Health Checks
 
@@ -279,43 +334,61 @@ KISS is designed with security as a primary concern:
 - **Minimal Capabilities**: Functions with all Linux capabilities dropped
 
 ### Network Security  
-- **Non-Privileged Port**: Runs on port 8080 (>1024) for non-root compatibility
-- **Bounded Request Size**: Maximum 8KB request size prevents memory exhaustion
-- **File Size Limits**: 50MB maximum file size served
-- **Path Sanitization**: Prevents access to server binary and normalizes paths
+- **Non-Privileged Port**: Configurable port (default 8080, >1024) for non-root compatibility
+- **Bounded Request Size**: Configurable request size limit (default 8KB) prevents memory exhaustion
+- **Connection Limits**: Configurable connection and keep-alive timeouts prevent resource exhaustion
+- **Path Sanitization**: Prevents access to server binary and normalizes paths via FNV hashing
 - **Binary Protection**: Blocks all access attempts to `/kiss` executable
 
 ### Operational Security
 - **Graceful Shutdown**: Handles SIGTERM/SIGINT for clean container termination
 - **Health Endpoints**: Separate `/health` and `/ready` endpoints for monitoring
-- **Worker Pool**: Bounded connection handling prevents resource exhaustion
+- **Async Connection Handling**: Lock-free concurrency prevents resource exhaustion
 - **No File Writes**: Server only reads files, never modifies filesystem
+- **Configuration Security**: No runtime configuration changes, startup-only parameter extraction
 
 ## Performance Architecture
 
-KISS implements a file-caching architecture that pre-loads all static files and pre-generates complete HTTP responses at startup, eliminating disk I/O during request processing.
+KISS implements an advanced zero-overhead architecture with lock-free caching, pre-generated responses, and micro-optimizations for maximum performance.
 
-### Architecture Overview
+### Core Architecture
 
-At startup, KISS scans the static directory and builds a file cache containing:
-- **Complete HTTP responses**: Pre-generated headers and content combined for single-write operations
-- **File content**: All files loaded entirely into memory
-- **Conditional responses**: Pre-computed 304 Not Modified responses
-- **Path variations**: Common URL patterns pre-computed to eliminate string operations
+**Lock-Free File Caching:**
+- Atomic RCU pattern with `AtomicPtr<CacheGeneration>` for zero-contention reads
+- Complete files preloaded at startup into memory-optimized cache structures
+- Cache-line efficient structs (48-byte `CacheEntry` alignment)
+- FNV hashing for fast path normalization and lookup
+
+**Zero-Allocation Request Processing:**
+- Pre-allocated buffers reused per connection via `.clear()` 
+- Single-pass HTTP parsing combining query detection, hashing, and validation
+- Direct byte manipulation avoiding UTF-8 overhead in hot paths
+- Boyer-Moore-like string matching for header processing
+
+**Response Optimization:**
+- **Unified responses**: Headers + content pre-combined for single `write()` syscall
+- **Conditional caching**: Pre-generated 304 Not Modified responses
+- **Zero-copy sharing**: `Arc<[u8]>` slices for memory efficiency
+- **Path trie**: Optimized URL matching with trailing slash handling
 
 ### Performance Characteristics
 
-**Performance Characteristics:**
-- Based on benchmark testing (see `docs/PERFORMANCES.md` for detailed results)
-- Optimized for small to medium files (< 1MB)
-- Zero disk I/O during request serving
-- Consistently low response times
+**Micro-Optimizations:**
+- Memory layout optimized for L1/L2 cache efficiency
+- Hot data fields placed first in structs for better cache locality
+- Minimal branching and predictable code paths
+- TCP_NODELAY enabled for reduced network latency
 
-**Implementation Details:**
-- Single write() system call per request
-- Pre-computed HTTP responses stored in memory
-- HashMap-based file lookups
-- Rust's zero-cost abstractions for performance
+**Scalability Features:**
+- Async Tokio runtime with per-connection task spawning
+- Lock-free concurrent access to file cache
+- Bounded request sizes prevent memory exhaustion
+- Graceful degradation under load
+
+**Configuration Performance:**
+- Zero runtime overhead: CLI/environment variables extracted once at startup
+- Direct variable access equivalent to compile-time constants
+- No global lookups or indirection in hot paths
 
 ### Security Considerations
 

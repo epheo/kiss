@@ -16,27 +16,27 @@ use kiss::get_mime_type_enum;
 #[command(author, version, about, long_about = None)]
 struct Config {
     /// Port to bind the server to
-    #[arg(short, long, default_value_t = 8080, value_parser = clap::value_parser!(u16).range(1..=65535))]
+    #[arg(short, long, env = "KISS_PORT", default_value_t = 8080, value_parser = clap::value_parser!(u16).range(1..=65535))]
     port: u16,
 
     /// Maximum size of incoming requests in bytes
-    #[arg(short = 'r', long, default_value_t = 8192)]
+    #[arg(short = 'r', long, env = "KISS_MAX_REQUEST_SIZE", default_value_t = 8192)]
     max_request_size: usize,
 
     /// Directory to serve static files from
-    #[arg(short = 's', long, default_value = "./content")]
+    #[arg(short = 's', long, env = "KISS_STATIC_DIR", default_value = "./content")]
     static_dir: String,
 
     /// Connection timeout in seconds
-    #[arg(short = 'c', long, default_value_t = 30)]
+    #[arg(short = 'c', long, env = "KISS_CONNECTION_TIMEOUT", default_value_t = 30)]
     connection_timeout_secs: u64,
 
     /// Keep-alive timeout in seconds
-    #[arg(short = 'k', long, default_value_t = 5)]
+    #[arg(short = 'k', long, env = "KISS_KEEPALIVE_TIMEOUT", default_value_t = 5)]
     keepalive_timeout_secs: u64,
 
     /// IP address to bind the server to
-    #[arg(short = 'b', long, default_value = "0.0.0.0")]
+    #[arg(short = 'b', long, env = "KISS_BIND_IP", default_value = "0.0.0.0")]
     bind_ip: String,
 }
 
