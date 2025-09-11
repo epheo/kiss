@@ -1,7 +1,7 @@
 use clap::Parser;
 use rustc_hash::FxHashMap;
 use std::fs::{read_dir, metadata, read};
-use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::SystemTime;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
@@ -42,37 +42,27 @@ struct Config {
 
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
-// Memory-optimized cache entry - structured for optimal cache line efficiency
+// Cache entry for static files
 #[derive(Clone, Debug)]
-#[repr(C)]
 struct CacheEntry {
-    // Hot path data first (most frequently accessed in request handling)
-    complete_response: Arc<[u8]>,     // 8 bytes (pointer)
-    header_length: u16,               // 2 bytes (where content starts in complete_response)
-    _padding: [u8; 6],                // 6 bytes padding for alignment
-    not_modified_response: Arc<[u8]>, // 8 bytes (pointer)
-    
-    // Frequently used for conditional requests
-    last_modified_timestamp: SystemTime, // 16 bytes (u64 + u32 typically)
-    etag: Arc<str>,                   // 8 bytes (pointer)
-    
-    // Total: 48 bytes - maintains cache line alignment
+    complete_response: Arc<[u8]>,        // Pre-generated complete HTTP response
+    header_length: u16,                   // Where content starts in complete_response
+    not_modified_response: Arc<[u8]>,    // Pre-generated 304 response
+    last_modified_timestamp: SystemTime, // For conditional requests
+    etag: Arc<str>,                      // For ETag validation
 }
 
-// Compact trie for prefix matching - optimized for trailing slash handling
+// Simple path cache using hash map
 #[derive(Debug, Clone)]
 struct PathTrie {
-    // Maps normalized paths to cache entries
-    exact_matches: FxHashMap<u32, CacheEntry>,
-    // Special handling for index files
-    index_entries: FxHashMap<u32, CacheEntry>, // Maps directory hash to index.html entry
+    // Maps path hashes to cache entries
+    entries: FxHashMap<u32, CacheEntry>,
 }
 
 impl PathTrie {
     fn new() -> Self {
         Self {
-            exact_matches: FxHashMap::default(),
-            index_entries: FxHashMap::default(),
+            entries: FxHashMap::default(),
         }
     }
     
@@ -112,30 +102,29 @@ impl PathTrie {
     }
     
     fn insert(&mut self, path: &str, entry: CacheEntry) {
-        let (path_hash, _is_directory_style) = Self::normalize_path_hash(path);
+        let (path_hash, _) = Self::normalize_path_hash(path);
+        self.entries.insert(path_hash, entry.clone());
         
-        // Always store in exact matches
-        self.exact_matches.insert(path_hash, entry.clone());
-        
-        // If this is an index.html file, also register it for directory-style access
+        // If this is an index.html file, also register it for directory access
         if path.ends_with("/index.html") {
             let dir_path = &path[..path.len()-11]; // Remove "/index.html"
             let (dir_hash, _) = Self::normalize_path_hash(dir_path);
-            self.index_entries.insert(dir_hash, entry);
+            self.entries.insert(dir_hash, entry);
         }
     }
     
     fn get(&self, path: &str) -> Option<CacheEntry> {
         let (path_hash, is_directory_style) = Self::normalize_path_hash(path);
         
-        // First try exact match
-        if let Some(entry) = self.exact_matches.get(&path_hash) {
+        // Try direct lookup first
+        if let Some(entry) = self.entries.get(&path_hash) {
             return Some(entry.clone());
         }
         
-        // For directory-style requests, try index.html
-        if is_directory_style || path == "/" {
-            if let Some(entry) = self.index_entries.get(&path_hash) {
+        // For root path, try index.html
+        if path == "/" {
+            let (index_hash, _) = Self::normalize_path_hash("/index.html");
+            if let Some(entry) = self.entries.get(&index_hash) {
                 return Some(entry.clone());
             }
         }
@@ -144,67 +133,11 @@ impl PathTrie {
     }
     
     fn entry_count(&self) -> usize {
-        self.exact_matches.len()
+        self.entries.len()
     }
 }
 
-// Lock-free cache with atomic RCU pattern
-#[derive(Debug)]
-struct OptimizedCache {
-    // Atomic pointer to current cache generation (lock-free reads)
-    current: AtomicPtr<CacheGeneration>,
-}
-
-#[derive(Debug)]
-struct CacheGeneration {
-    // PathTrie for efficient prefix matching and trailing slash handling
-    trie: PathTrie,
-}
-
-impl OptimizedCache {
-    fn new() -> Self {
-        let initial_cache = Box::into_raw(Box::new(CacheGeneration {
-            trie: PathTrie::new(),
-        }));
-        
-        Self {
-            current: AtomicPtr::new(initial_cache),
-        }
-    }
-    
-    // Lock-free read operation using atomic load with trie lookup
-    fn get(&self, path: &str) -> Option<CacheEntry> {
-        // Load the current cache pointer atomically
-        let cache_ptr = self.current.load(Ordering::Acquire);
-        
-        // SAFETY: The pointer is valid as long as we don't perform concurrent updates
-        // For a static file server, the cache is built once at startup
-        unsafe {
-            let cache = &*cache_ptr;
-            cache.trie.get(path)
-        }
-    }
-    
-    // Only used during initial cache building (single-threaded)
-    fn insert(&self, path: String, entry: CacheEntry) {
-        // Load current cache
-        let cache_ptr = self.current.load(Ordering::Acquire);
-        
-        // SAFETY: During cache building phase, this is single-threaded
-        unsafe {
-            let cache = &mut *(cache_ptr as *mut CacheGeneration);
-            cache.trie.insert(&path, entry);
-        }
-    }
-    
-    fn entry_count(&self) -> usize {
-        let cache_ptr = self.current.load(Ordering::Acquire);
-        unsafe {
-            let cache = &*cache_ptr;
-            cache.trie.entry_count()
-        }
-    }
-}
+// Simple file cache - no need for complex abstractions since it's built once at startup
 
 // Zero-I/O file metadata - everything preloaded in memory
 #[derive(Clone, Debug)]
@@ -216,9 +149,9 @@ struct FileMetadata {
     last_modified_timestamp: SystemTime, // For If-Modified-Since comparison
 }
 
-// Static storage for header templates and optimized file cache - initialized at startup
+// Static storage for header templates and file cache - initialized at startup
 static HEADER_TEMPLATES: OnceCell<HeaderTemplates> = OnceCell::new();
-static FILE_CACHE: OnceCell<OptimizedCache> = OnceCell::new();
+static FILE_CACHE: OnceCell<PathTrie> = OnceCell::new();
 
 // Pre-compiled response templates split into headers and bodies for unified handling
 #[derive(Debug)]
@@ -428,22 +361,22 @@ fn parse_request_line_fast(request: &[u8]) -> Option<(&[u8], &str, &str)> {
     Some((method, path, version))
 }
 
-fn build_file_cache(static_dir: &str) -> OptimizedCache {
-    let cache = OptimizedCache::new();
+fn build_file_cache(static_dir: &str) -> PathTrie {
+    let mut cache = PathTrie::new();
     
-    if let Err(e) = discover_files_recursive(static_dir, "", &cache) {
+    if let Err(e) = discover_files_recursive(static_dir, "", &mut cache) {
         eprintln!("Warning: Failed to build file cache: {}", e);
     }
     
     let entry_count = cache.entry_count();
-    println!("Optimized file cache built with {} entries", entry_count);
+    println!("File cache built with {} entries", entry_count);
     cache
 }
 
 fn discover_files_recursive(
     base_dir: &str,
     relative_path: &str,
-    cache: &OptimizedCache,
+    cache: &mut PathTrie,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Optimized path construction using pre-allocated capacity
     let mut full_path = String::with_capacity(base_dir.len() + relative_path.len() + 1);
@@ -484,17 +417,15 @@ fn discover_files_recursive(
                 
                 // Convert FileMetadata to optimized CacheEntry
                 let cache_entry = CacheEntry {
-                    // Hot path data first for better cache locality
                     complete_response: Arc::from(file_metadata.complete_response.into_boxed_slice()),
                     header_length: file_metadata.header_length,
-                    _padding: [0; 6],
                     not_modified_response: Arc::from(file_metadata.not_modified_response.into_boxed_slice()),
                     last_modified_timestamp: file_metadata.last_modified_timestamp,
                     etag: Arc::from(file_metadata.etag.into_boxed_str()),
                 };
                 
                 // Cache entry - trie automatically handles trailing slashes and index.html mapping
-                cache.insert(url_path, cache_entry);
+                cache.insert(&url_path, cache_entry);
             }
         } else if metadata.is_dir() {
             // Recursively process directories
