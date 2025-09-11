@@ -52,14 +52,14 @@ struct CacheEntry {
     etag: Arc<str>,                      // For ETag validation
 }
 
-// Simple path cache using hash map
+// File cache with path normalization and hashing
 #[derive(Debug, Clone)]
-struct PathTrie {
+struct FileCache {
     // Maps path hashes to cache entries
     entries: FxHashMap<u32, CacheEntry>,
 }
 
-impl PathTrie {
+impl FileCache {
     fn new() -> Self {
         Self {
             entries: FxHashMap::default(),
@@ -131,7 +131,7 @@ impl PathTrie {
 
 // Static storage for header templates and file cache - initialized at startup
 static HEADER_TEMPLATES: OnceCell<HeaderTemplates> = OnceCell::new();
-static FILE_CACHE: OnceCell<PathTrie> = OnceCell::new();
+static FILE_CACHE: OnceCell<FileCache> = OnceCell::new();
 
 // Pre-compiled response templates split into headers and bodies for unified handling
 #[derive(Debug)]
@@ -336,8 +336,8 @@ fn parse_request_line_fast(request: &[u8]) -> Option<(&[u8], &str, &str)> {
     Some((method, path, version))
 }
 
-fn build_file_cache(static_dir: &str) -> PathTrie {
-    let mut cache = PathTrie::new();
+fn build_file_cache(static_dir: &str) -> FileCache {
+    let mut cache = FileCache::new();
     
     if let Err(e) = discover_files_recursive(static_dir, "", &mut cache) {
         eprintln!("Warning: Failed to build file cache: {}", e);
@@ -351,7 +351,7 @@ fn build_file_cache(static_dir: &str) -> PathTrie {
 fn discover_files_recursive(
     base_dir: &str,
     relative_path: &str,
-    cache: &mut PathTrie,
+    cache: &mut FileCache,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Optimized path construction using pre-allocated capacity
     let mut full_path = String::with_capacity(base_dir.len() + relative_path.len() + 1);
@@ -390,7 +390,7 @@ fn discover_files_recursive(
                 url_path.push('/');
                 url_path.push_str(&current_relative);
                 
-                // Cache entry - trie automatically handles trailing slashes and index.html mapping
+                // Cache entry - automatically handles trailing slashes and index.html mapping
                 cache.insert(&url_path, cache_entry);
             }
         } else if metadata.is_dir() {
@@ -724,9 +724,7 @@ async fn handle_request(
         return Ok(());
     }
 
-    // Inline static file serving for zero function call overhead
-    
-    // Fast path lookup with integrated query handling in PathTrie
+    // Fast path lookup with integrated query handling in FileCache
     let file_cache = FILE_CACHE.get().unwrap();
     
     // Direct path lookup - query parameters handled in hash computation
