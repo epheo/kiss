@@ -10,8 +10,8 @@ Those tests have been performed on my laptop "12th Gen Intel(R) Core(TM) i7-1280
 
 **Benchmark Results (wrk):**
 
-- Peak throughput: 694,648 req/s (8 threads, 250 concurrent connections)
-- Average latency: 301.19μs (microseconds)
+- Peak throughput: 795,141 req/s (8 threads, 250 concurrent connections, 10s test)
+- Average latency: 259.91μs (microseconds)
 - Small file performance: 435,224 req/s vs nginx 99,778 req/s (4.36x faster)
 - Medium file performance: 60,930 req/s vs nginx 45,086 req/s  
 - Cache performance: 82,924 req/s vs nginx 77,813 req/s
@@ -146,7 +146,7 @@ Example calculations:
 
 **Performance Characteristics:**
 
-- Peak throughput: 694,648 req/s (wrk benchmark with 250 concurrent connections)
+- Peak throughput: 795,141 req/s (wrk benchmark with 250 concurrent connections)
 - Medium file performance: 60,930 req/s
 - Response times: 0.462ms mean (100,000 requests), 0.5-1.6ms for files under 1MB
 - Architecture: In-memory serving with zero disk I/O

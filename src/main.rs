@@ -119,9 +119,9 @@ impl FileCache {
         }
     }
     
-    fn get(&self, path: &str) -> Option<CacheEntry> {
+    fn get(&self, path: &str) -> Option<&CacheEntry> {
         let (path_hash, _) = Self::normalize_path_hash(path);
-        self.entries.get(&path_hash).cloned()
+        self.entries.get(&path_hash)
     }
     
     fn entry_count(&self) -> usize {
@@ -141,7 +141,6 @@ struct HeaderTemplates {
     method_not_allowed: Vec<u8>,
     request_too_large: Vec<u8>,
     bad_request: Vec<u8>,
-    request_timeout: Vec<u8>,
     
     // Health endpoint responses (unified single-write pattern)
     health_complete: Vec<u8>,
@@ -160,7 +159,6 @@ impl HeaderTemplates {
             method_not_allowed: b"HTTP/1.1 405 Method Not Allowed\r\nContent-Type: text/plain\r\nContent-Length: 18\r\nX-Content-Type-Options: nosniff\r\nConnection: keep-alive\r\n\r\nMethod not allowed".to_vec(),
             request_too_large: b"HTTP/1.1 413 Request Entity Too Large\r\nContent-Type: text/plain\r\nContent-Length: 17\r\nX-Content-Type-Options: nosniff\r\nConnection: keep-alive\r\n\r\nRequest too large".to_vec(),
             bad_request: b"HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\nContent-Length: 17\r\nX-Content-Type-Options: nosniff\r\nConnection: keep-alive\r\n\r\nMalformed request".to_vec(),
-            request_timeout: b"HTTP/1.1 408 Request Timeout\r\nContent-Type: text/plain\r\nContent-Length: 15\r\nX-Content-Type-Options: nosniff\r\nConnection: keep-alive\r\n\r\nRequest timeout".to_vec(),
             
             health_complete,
             health_headers_only,
@@ -555,26 +553,18 @@ async fn shutdown_signal() {
 async fn handle_connection(
     mut stream: TcpStream,
     max_request_size: usize,
-    connection_timeout_secs: u64,
+    _connection_timeout_secs: u64,
     keepalive_timeout_secs: u64,
 ) {
-    // Set connection timeout - direct value, zero overhead
-    let connection_result = timeout(
-        Duration::from_secs(connection_timeout_secs),
-        handle_connection_inner(&mut stream, max_request_size, keepalive_timeout_secs),
-    )
-    .await;
-
-    if connection_result.is_err() {
-        let _ = stream.write_all(&HEADER_TEMPLATES.get().unwrap().request_timeout).await;
-    }
+    // Direct connection handling without double timeout
+    let _ = handle_connection_inner(&mut stream, max_request_size, keepalive_timeout_secs).await;
 }
 
 async fn handle_connection_inner(
     stream: &mut TcpStream,
     max_request_size: usize,
     keepalive_timeout_secs: u64,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+) {
     // Pre-allocate buffers once per connection (not per request)
     let mut request_line = Vec::with_capacity(512);
     let mut header_buffer = Vec::with_capacity(1024);
@@ -606,7 +596,7 @@ async fn handle_connection_inner(
             Ok(Ok(0)) | Err(_) => break, // Connection closed or timeout
             Ok(Err(_)) => break,         // Read error
             Ok(Ok(size)) if size > max_request_size => {
-                stream.write_all(&HEADER_TEMPLATES.get().unwrap().request_too_large).await?;
+                let _ = stream.write_all(&HEADER_TEMPLATES.get().unwrap().request_too_large).await;
                 break;
             }
             Ok(Ok(_)) => {}
@@ -621,13 +611,13 @@ async fn handle_connection_inner(
         let (method, path, version) = match parse_request_line_fast(request_bytes) {
             Some((m, p, v)) => (m, p, v),
             None => {
-                stream.write_all(&HEADER_TEMPLATES.get().unwrap().bad_request).await?;
+                let _ = stream.write_all(&HEADER_TEMPLATES.get().unwrap().bad_request).await;
                 break;
             }
         };
 
         if method != b"GET" && method != b"HEAD" {
-            stream.write_all(&HEADER_TEMPLATES.get().unwrap().method_not_allowed).await?;
+            let _ = stream.write_all(&HEADER_TEMPLATES.get().unwrap().method_not_allowed).await;
             break;
         }
 
@@ -681,17 +671,14 @@ async fn handle_connection_inner(
         let is_head = method == b"HEAD";
         
         // Direct stream usage for optimal response performance
-        match handle_request(stream, path, is_head, if_modified_since, if_none_match).await {
-            Ok(_) => {
-                if !keep_alive {
-                    break;
-                }
+        if handle_request(stream, path, is_head, if_modified_since, if_none_match).await {
+            if !keep_alive {
+                break;
             }
-            Err(_) => break,
+        } else {
+            break;
         }
     }
-
-    Ok(())
 }
 
 
@@ -701,27 +688,27 @@ async fn handle_request(
     is_head: bool,
     if_modified_since: Option<&[u8]>,
     if_none_match: Option<&[u8]>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+) -> bool {
     // Handle health check endpoints using unified response pattern
     let templates = HEADER_TEMPLATES.get().unwrap();
     
     // Unified single-write pattern for health endpoints
     if path == "/health" {
-        if is_head {
-            stream.write_all(&templates.health_headers_only).await?;
+        let result = if is_head {
+            stream.write_all(&templates.health_headers_only).await
         } else {
-            stream.write_all(&templates.health_complete).await?;
-        }
-        return Ok(());
+            stream.write_all(&templates.health_complete).await
+        };
+        return result.is_ok();
     }
 
     if path == "/ready" {
-        if is_head {
-            stream.write_all(&templates.ready_headers_only).await?;
+        let result = if is_head {
+            stream.write_all(&templates.ready_headers_only).await
         } else {
-            stream.write_all(&templates.ready_complete).await?;
-        }
-        return Ok(());
+            stream.write_all(&templates.ready_complete).await
+        };
+        return result.is_ok();
     }
 
     // Fast path lookup with integrated query handling in FileCache
@@ -739,8 +726,8 @@ async fn handle_request(
                 if let Ok(client_time) = httpdate::parse_http_date(if_modified_since_str) {
                     if cache_entry.last_modified_timestamp <= client_time {
                         // Fast path: Use pre-generated 304 response
-                        stream.write_all(&cache_entry.not_modified_response).await?;
-                        return Ok(());
+                        let result = stream.write_all(&cache_entry.not_modified_response).await;
+                        return result.is_ok();
                     }
                 }
             }
@@ -753,24 +740,24 @@ async fn handle_request(
             if client_etag_bytes == b"*" || 
                (client_etag_bytes.windows(etag_bytes.len()).any(|window| window == etag_bytes)) {
                 // Fast path: Use pre-generated 304 response
-                stream.write_all(&cache_entry.not_modified_response).await?;
-                return Ok(());
+                let result = stream.write_all(&cache_entry.not_modified_response).await;
+                return result.is_ok();
             }
         }
 
         // Single write operation - minimal system calls
-        if is_head {
+        let result = if is_head {
             // HEAD request: Send headers only via slice (zero-copy, single write)
-            stream.write_all(&cache_entry.complete_response[..cache_entry.header_length as usize]).await?;
+            stream.write_all(&cache_entry.complete_response[..cache_entry.header_length as usize]).await
         } else {
             // GET request: Send complete response (headers + content in single write!)
-            stream.write_all(&cache_entry.complete_response).await?;
-        }
+            stream.write_all(&cache_entry.complete_response).await
+        };
+        result.is_ok()
     } else {
         // File not in cache - return 404
-        stream.write_all(&HEADER_TEMPLATES.get().unwrap().not_found).await?;
+        let result = stream.write_all(&HEADER_TEMPLATES.get().unwrap().not_found).await;
+        result.is_ok()
     }
-
-    Ok(())
 }
 
