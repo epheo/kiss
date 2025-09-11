@@ -114,7 +114,7 @@ impl PathTrie {
     }
     
     fn get(&self, path: &str) -> Option<CacheEntry> {
-        let (path_hash, is_directory_style) = Self::normalize_path_hash(path);
+        let (path_hash, _is_directory_style) = Self::normalize_path_hash(path);
         
         // Try direct lookup first
         if let Some(entry) = self.entries.get(&path_hash) {
@@ -139,15 +139,7 @@ impl PathTrie {
 
 // Simple file cache - no need for complex abstractions since it's built once at startup
 
-// Zero-I/O file metadata - everything preloaded in memory
-#[derive(Clone, Debug)]
-struct FileMetadata {
-    complete_response: Vec<u8>,      // Headers + content combined for single write
-    header_length: u16,              // Length of headers in complete_response
-    not_modified_response: Vec<u8>,  // Pre-generated 304 response
-    etag: String,                    // For conditional logic
-    last_modified_timestamp: SystemTime, // For If-Modified-Since comparison
-}
+// Simple file cache - no need for complex abstractions since it's built once at startup
 
 // Static storage for header templates and file cache - initialized at startup
 static HEADER_TEMPLATES: OnceCell<HeaderTemplates> = OnceCell::new();
@@ -409,20 +401,11 @@ fn discover_files_recursive(
         
         if metadata.is_file() {
             // Generate cache entry for this file
-            if let Ok(file_metadata) = generate_file_metadata(&entry.path(), &current_relative) {
+            if let Ok(cache_entry) = generate_cache_entry(&entry.path(), &current_relative) {
                 // Optimized URL path construction
                 let mut url_path = String::with_capacity(current_relative.len() + 1);
                 url_path.push('/');
                 url_path.push_str(&current_relative);
-                
-                // Convert FileMetadata to optimized CacheEntry
-                let cache_entry = CacheEntry {
-                    complete_response: Arc::from(file_metadata.complete_response.into_boxed_slice()),
-                    header_length: file_metadata.header_length,
-                    not_modified_response: Arc::from(file_metadata.not_modified_response.into_boxed_slice()),
-                    last_modified_timestamp: file_metadata.last_modified_timestamp,
-                    etag: Arc::from(file_metadata.etag.into_boxed_str()),
-                };
                 
                 // Cache entry - trie automatically handles trailing slashes and index.html mapping
                 cache.insert(&url_path, cache_entry);
@@ -436,7 +419,7 @@ fn discover_files_recursive(
     Ok(())
 }
 
-fn generate_file_metadata(file_path: &std::path::Path, _relative_path: &str) -> Result<FileMetadata, Box<dyn std::error::Error>> {
+fn generate_cache_entry(file_path: &std::path::Path, _relative_path: &str) -> Result<CacheEntry, Box<dyn std::error::Error>> {
     let file_metadata = metadata(file_path)?;
     let size = file_metadata.len();
     let last_modified_raw = file_metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
@@ -486,11 +469,11 @@ fn generate_file_metadata(file_path: &std::path::Path, _relative_path: &str) -> 
         etag
     ).into_bytes();
     
-    Ok(FileMetadata {
-        complete_response,
+    Ok(CacheEntry {
+        complete_response: Arc::from(complete_response.into_boxed_slice()),
         header_length,
-        not_modified_response,
-        etag,
+        not_modified_response: Arc::from(not_modified_response.into_boxed_slice()),
+        etag: Arc::from(etag.into_boxed_str()),
         last_modified_timestamp: last_modified,
     })
 }
@@ -640,7 +623,7 @@ async fn handle_connection_inner(
             Ok(Ok(0)) | Err(_) => break, // Connection closed or timeout
             Ok(Err(_)) => break,         // Read error
             Ok(Ok(size)) if size > max_request_size => {
-                send_precompiled_response(stream, &HEADER_TEMPLATES.get().unwrap().request_too_large).await?;
+                stream.write_all(&HEADER_TEMPLATES.get().unwrap().request_too_large).await?;
                 break;
             }
             Ok(Ok(_)) => {}
@@ -655,13 +638,13 @@ async fn handle_connection_inner(
         let (method, path, version) = match parse_request_line_fast(request_bytes) {
             Some((m, p, v)) => (m, p, v),
             None => {
-                send_precompiled_response(stream, &HEADER_TEMPLATES.get().unwrap().bad_request).await?;
+                stream.write_all(&HEADER_TEMPLATES.get().unwrap().bad_request).await?;
                 break;
             }
         };
 
         if method != b"GET" && method != b"HEAD" {
-            send_precompiled_response(stream, &HEADER_TEMPLATES.get().unwrap().method_not_allowed).await?;
+            stream.write_all(&HEADER_TEMPLATES.get().unwrap().method_not_allowed).await?;
             break;
         }
 
@@ -728,14 +711,6 @@ async fn handle_connection_inner(
     Ok(())
 }
 
-// Helper function for sending precompiled responses efficiently
-async fn send_precompiled_response(
-    stream: &mut TcpStream,
-    response: &[u8],
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    stream.write_all(response).await?;
-    Ok(())
-}
 
 async fn handle_request(
     stream: &mut TcpStream,
