@@ -48,14 +48,15 @@ static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 struct CacheEntry {
     // Hot path data first (most frequently accessed in request handling)
     complete_response: Arc<[u8]>,     // 8 bytes (pointer)
-    headers_only: Arc<[u8]>,          // 8 bytes (pointer)
+    header_length: u16,               // 2 bytes (where content starts in complete_response)
+    _padding: [u8; 6],                // 6 bytes padding for alignment
     not_modified_response: Arc<[u8]>, // 8 bytes (pointer)
     
     // Frequently used for conditional requests
     last_modified_timestamp: SystemTime, // 16 bytes (u64 + u32 typically)
     etag: Arc<str>,                   // 8 bytes (pointer)
     
-    // Total: 48 bytes - fits well within cache lines
+    // Total: 48 bytes - maintains cache line alignment
 }
 
 // Compact trie for prefix matching - optimized for trailing slash handling
@@ -209,7 +210,7 @@ impl OptimizedCache {
 #[derive(Clone, Debug)]
 struct FileMetadata {
     complete_response: Vec<u8>,      // Headers + content combined for single write
-    headers_only: Vec<u8>,           // Headers only for HEAD requests
+    header_length: u16,              // Length of headers in complete_response
     not_modified_response: Vec<u8>,  // Pre-generated 304 response
     etag: String,                    // For conditional logic
     last_modified_timestamp: SystemTime, // For If-Modified-Since comparison
@@ -485,7 +486,8 @@ fn discover_files_recursive(
                 let cache_entry = CacheEntry {
                     // Hot path data first for better cache locality
                     complete_response: Arc::from(file_metadata.complete_response.into_boxed_slice()),
-                    headers_only: Arc::from(file_metadata.headers_only.into_boxed_slice()),
+                    header_length: file_metadata.header_length,
+                    _padding: [0; 6],
                     not_modified_response: Arc::from(file_metadata.not_modified_response.into_boxed_slice()),
                     last_modified_timestamp: file_metadata.last_modified_timestamp,
                     etag: Arc::from(file_metadata.etag.into_boxed_str()),
@@ -539,11 +541,8 @@ fn generate_file_metadata(file_path: &std::path::Path, _relative_path: &str) -> 
         mime_type_str, actual_size, last_modified_str, etag
     ).into_bytes();
     
-    // Pre-generate headers-only response for HEAD requests
-    let headers_only = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\nLast-Modified: {}\r\nETag: {}\r\nCache-Control: public, max-age=3600\r\nX-Content-Type-Options: nosniff\r\nConnection: keep-alive\r\n\r\n",
-        mime_type_str, actual_size, last_modified_str, etag
-    ).into_bytes();
+    // Store header length for HEAD request slicing
+    let header_length = headers.len() as u16;
     
     // Pre-combine headers + content for single write()
     let mut complete_response = Vec::with_capacity(headers.len() + content.len());
@@ -558,7 +557,7 @@ fn generate_file_metadata(file_path: &std::path::Path, _relative_path: &str) -> 
     
     Ok(FileMetadata {
         complete_response,
-        headers_only,
+        header_length,
         not_modified_response,
         etag,
         last_modified_timestamp: last_modified,
@@ -681,7 +680,7 @@ async fn handle_connection_inner(
     keepalive_timeout_secs: u64,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Pre-allocate buffers once per connection (not per request)
-    let mut request_line = String::with_capacity(512);
+    let mut request_line = Vec::with_capacity(512);
     let mut header_buffer = Vec::with_capacity(1024);
     let mut if_modified_since_buf = Vec::with_capacity(256);
     let mut if_none_match_buf = Vec::with_capacity(256);
@@ -704,7 +703,7 @@ async fn handle_connection_inner(
         // Read request line with timeout - direct value, zero overhead
         match timeout(
             Duration::from_secs(keepalive_timeout_secs),
-            reader.read_line(&mut request_line),
+            read_line_bytes(&mut reader, &mut request_line),
         )
         .await
         {
@@ -717,12 +716,12 @@ async fn handle_connection_inner(
             Ok(Ok(_)) => {}
         }
 
-        if request_line.trim().is_empty() {
+        if trim_header_line(&request_line).is_empty() {
             continue; // Keep-alive, wait for next request
         }
 
         // Zero-allocation HTTP parsing - avoid string splits and allocations
-        let request_bytes = request_line.trim().as_bytes();
+        let request_bytes = trim_header_line(&request_line);
         let (method, path, version) = match parse_request_line_fast(request_bytes) {
             Some((m, p, v)) => (m, p, v),
             None => {
@@ -880,8 +879,8 @@ async fn handle_request(
 
         // Single write operation - minimal system calls
         if is_head {
-            // HEAD request: Send headers only (pre-generated, single write)
-            stream.write_all(&cache_entry.headers_only).await?;
+            // HEAD request: Send headers only via slice (zero-copy, single write)
+            stream.write_all(&cache_entry.complete_response[..cache_entry.header_length as usize]).await?;
         } else {
             // GET request: Send complete response (headers + content in single write!)
             stream.write_all(&cache_entry.complete_response).await?;

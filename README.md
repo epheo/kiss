@@ -414,10 +414,10 @@ This architecture aligns with container deployment patterns:
 - Reduced system call overhead
 
 **Limitations:**
+
 - Memory usage scales with total content size
 - Optimized for files under 1MB
 - Content is immutable during runtime (requires container restart for changes)
 - Startup time correlates with file count and total size
 
 For detailed performance analysis and benchmark results, see `docs/PERFORMANCES.md`.
-
