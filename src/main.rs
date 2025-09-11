@@ -109,37 +109,25 @@ impl PathTrie {
         if path.ends_with("/index.html") {
             let dir_path = &path[..path.len()-11]; // Remove "/index.html"
             let (dir_hash, _) = Self::normalize_path_hash(dir_path);
-            self.entries.insert(dir_hash, entry);
+            self.entries.insert(dir_hash, entry.clone());
+            
+            // Also map root /index.html to / for direct access
+            if path == "/index.html" {
+                let (root_hash, _) = Self::normalize_path_hash("/");
+                self.entries.insert(root_hash, entry);
+            }
         }
     }
     
     fn get(&self, path: &str) -> Option<CacheEntry> {
-        let (path_hash, _is_directory_style) = Self::normalize_path_hash(path);
-        
-        // Try direct lookup first
-        if let Some(entry) = self.entries.get(&path_hash) {
-            return Some(entry.clone());
-        }
-        
-        // For root path, try index.html
-        if path == "/" {
-            let (index_hash, _) = Self::normalize_path_hash("/index.html");
-            if let Some(entry) = self.entries.get(&index_hash) {
-                return Some(entry.clone());
-            }
-        }
-        
-        None
+        let (path_hash, _) = Self::normalize_path_hash(path);
+        self.entries.get(&path_hash).cloned()
     }
     
     fn entry_count(&self) -> usize {
         self.entries.len()
     }
 }
-
-// Simple file cache - no need for complex abstractions since it's built once at startup
-
-// Simple file cache - no need for complex abstractions since it's built once at startup
 
 // Static storage for header templates and file cache - initialized at startup
 static HEADER_TEMPLATES: OnceCell<HeaderTemplates> = OnceCell::new();
@@ -344,11 +332,6 @@ fn parse_request_line_fast(request: &[u8]) -> Option<(&[u8], &str, &str)> {
     // Convert path and version to &str for compatibility with existing code
     let path = std::str::from_utf8(path_bytes).ok()?;
     let version = std::str::from_utf8(version_bytes).ok()?;
-    
-    // Basic validation
-    if method.is_empty() || path.is_empty() || version.is_empty() {
-        return None;
-    }
     
     Some((method, path, version))
 }
