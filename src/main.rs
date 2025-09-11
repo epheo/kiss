@@ -670,7 +670,6 @@ async fn handle_connection(
 
     if connection_result.is_err() {
         let _ = stream.write_all(&HEADER_TEMPLATES.get().unwrap().request_timeout).await;
-        let _ = stream.flush().await;
     }
 }
 
@@ -804,7 +803,6 @@ async fn send_precompiled_response(
     response: &[u8],
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     stream.write_all(response).await?;
-    stream.flush().await?;
     Ok(())
 }
 
@@ -825,7 +823,6 @@ async fn handle_request(
         } else {
             stream.write_all(&templates.health_complete).await?;
         }
-        stream.flush().await?;
         return Ok(());
     }
 
@@ -835,7 +832,6 @@ async fn handle_request(
         } else {
             stream.write_all(&templates.ready_complete).await?;
         }
-        stream.flush().await?;
         return Ok(());
     }
 
@@ -857,7 +853,6 @@ async fn handle_request(
                     if cache_entry.last_modified_timestamp <= client_time {
                         // Fast path: Use pre-generated 304 response
                         stream.write_all(&cache_entry.not_modified_response).await?;
-                        stream.flush().await?;
                         return Ok(());
                     }
                 }
@@ -872,7 +867,6 @@ async fn handle_request(
                (client_etag_bytes.windows(etag_bytes.len()).any(|window| window == etag_bytes)) {
                 // Fast path: Use pre-generated 304 response
                 stream.write_all(&cache_entry.not_modified_response).await?;
-                stream.flush().await?;
                 return Ok(());
             }
         }
@@ -885,11 +879,9 @@ async fn handle_request(
             // GET request: Send complete response (headers + content in single write!)
             stream.write_all(&cache_entry.complete_response).await?;
         }
-        stream.flush().await?;
     } else {
         // File not in cache - return 404
         stream.write_all(&HEADER_TEMPLATES.get().unwrap().not_found).await?;
-        stream.flush().await?;
     }
 
     Ok(())
