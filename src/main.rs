@@ -3,11 +3,11 @@ use rustc_hash::FxHashMap;
 use std::fs::{read_dir, metadata, read};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::SystemTime;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, WriteHalf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::signal;
 use tokio::time::{timeout, Duration};
-use once_cell::sync::OnceCell;
+use std::sync::OnceLock;
 use std::sync::Arc;
 use kiss::get_mime_type_enum;
 
@@ -27,10 +27,6 @@ struct Config {
     #[arg(short = 's', long, env = "KISS_STATIC_DIR", default_value = "./content")]
     static_dir: String,
 
-    /// Connection timeout in seconds
-    #[arg(short = 'c', long, env = "KISS_CONNECTION_TIMEOUT", default_value_t = 30)]
-    connection_timeout_secs: u64,
-
     /// Keep-alive timeout in seconds
     #[arg(short = 'k', long, env = "KISS_KEEPALIVE_TIMEOUT", default_value_t = 5)]
     keepalive_timeout_secs: u64,
@@ -46,17 +42,15 @@ static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 #[derive(Clone, Debug)]
 struct CacheEntry {
     complete_response: Arc<[u8]>,        // Pre-generated complete HTTP response
-    header_length: u16,                   // Where content starts in complete_response
+    header_length: usize,                 // Where content starts in complete_response
     not_modified_response: Arc<[u8]>,    // Pre-generated 304 response
     last_modified_timestamp: SystemTime, // For conditional requests
     etag: Arc<str>,                      // For ETag validation
 }
 
-// File cache with path normalization and hashing
 #[derive(Debug, Clone)]
 struct FileCache {
-    // Maps path hashes to cache entries
-    entries: FxHashMap<u32, CacheEntry>,
+    entries: FxHashMap<Box<str>, CacheEntry>,
 }
 
 impl FileCache {
@@ -65,73 +59,55 @@ impl FileCache {
             entries: FxHashMap::default(),
         }
     }
-    
-    // Optimized path normalization with integrated query stripping
-    // Single-pass processing: query detection + hash computation + trailing slash handling
+
+    // Strip query string and trailing slash, return normalized slice
     #[inline]
-    fn normalize_path_hash(path: &str) -> (u32, bool) {
-        const FNV_OFFSET_BASIS: u32 = 2166136261;
-        const FNV_PRIME: u32 = 16777619;
-        
-        let path_bytes = path.as_bytes();
-        let mut hash = FNV_OFFSET_BASIS;
-        let mut end_pos = path_bytes.len();
-        let mut is_directory_style = false;
-        
-        // Single pass: find query position and check for trailing slash
-        for (i, &byte) in path_bytes.iter().enumerate() {
-            if byte == b'?' {
-                end_pos = i; // Stop at query parameter
+    fn normalize_path(path: &str) -> &str {
+        let bytes = path.as_bytes();
+        let mut end = bytes.len();
+
+        for (i, &b) in bytes.iter().enumerate() {
+            if b == b'?' {
+                end = i;
                 break;
             }
         }
-        
-        // Check for directory-style path (trailing slash before query)
-        if end_pos > 1 && path_bytes[end_pos - 1] == b'/' {
-            is_directory_style = true;
-            end_pos -= 1; // Remove trailing slash from hash computation
+
+        if end > 1 && bytes[end - 1] == b'/' {
+            end -= 1;
         }
-        
-        // Hash the clean, normalized path portion
-        for &byte in &path_bytes[..end_pos] {
-            hash ^= byte as u32;
-            hash = hash.wrapping_mul(FNV_PRIME);
-        }
-        
-        (hash, is_directory_style)
+
+        &path[..end]
     }
-    
+
     fn insert(&mut self, path: &str, entry: CacheEntry) {
-        let (path_hash, _) = Self::normalize_path_hash(path);
-        self.entries.insert(path_hash, entry.clone());
-        
-        // If this is an index.html file, also register it for directory access
+        let norm = Self::normalize_path(path);
+        self.entries.insert(Box::from(norm), entry.clone());
+
         if path.ends_with("/index.html") {
-            let dir_path = &path[..path.len()-11]; // Remove "/index.html"
-            let (dir_hash, _) = Self::normalize_path_hash(dir_path);
-            self.entries.insert(dir_hash, entry.clone());
-            
-            // Also map root /index.html to / for direct access
+            let dir_path = &path[..path.len() - 11];
+            let dir_norm = if dir_path.is_empty() { "/" } else { Self::normalize_path(dir_path) };
+            self.entries.insert(Box::from(dir_norm), entry.clone());
+
             if path == "/index.html" {
-                let (root_hash, _) = Self::normalize_path_hash("/");
-                self.entries.insert(root_hash, entry);
+                self.entries.insert(Box::from("/"), entry);
             }
         }
     }
-    
+
     fn get(&self, path: &str) -> Option<&CacheEntry> {
-        let (path_hash, _) = Self::normalize_path_hash(path);
-        self.entries.get(&path_hash)
+        let norm = Self::normalize_path(path);
+        self.entries.get(norm)
     }
-    
+
     fn entry_count(&self) -> usize {
         self.entries.len()
     }
 }
 
 // Static storage for header templates and file cache - initialized at startup
-static HEADER_TEMPLATES: OnceCell<HeaderTemplates> = OnceCell::new();
-static FILE_CACHE: OnceCell<FileCache> = OnceCell::new();
+static HEADER_TEMPLATES: OnceLock<HeaderTemplates> = OnceLock::new();
+static FILE_CACHE: OnceLock<FileCache> = OnceLock::new();
 
 // Pre-compiled response templates split into headers and bodies for unified handling
 #[derive(Debug)]
@@ -151,72 +127,49 @@ struct HeaderTemplates {
 
 impl HeaderTemplates {
     fn new() -> Self {
-        let (health_complete, health_headers_only) = Self::create_health_response();
-        let (ready_complete, ready_headers_only) = Self::create_ready_response();
-        
+        let (health_complete, health_headers_only) = Self::create_json_response(br#"{"status":"healthy","timestamp":"0"}"#);
+        let (ready_complete, ready_headers_only) = Self::create_json_response(br#"{"status":"ready","timestamp":"0"}"#);
+
         Self {
             not_found: b"HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nContent-Length: 14\r\nX-Content-Type-Options: nosniff\r\nConnection: keep-alive\r\n\r\nFile not found".to_vec(),
             method_not_allowed: b"HTTP/1.1 405 Method Not Allowed\r\nContent-Type: text/plain\r\nContent-Length: 18\r\nX-Content-Type-Options: nosniff\r\nConnection: keep-alive\r\n\r\nMethod not allowed".to_vec(),
             request_too_large: b"HTTP/1.1 413 Request Entity Too Large\r\nContent-Type: text/plain\r\nContent-Length: 17\r\nX-Content-Type-Options: nosniff\r\nConnection: keep-alive\r\n\r\nRequest too large".to_vec(),
             bad_request: b"HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\nContent-Length: 17\r\nX-Content-Type-Options: nosniff\r\nConnection: keep-alive\r\n\r\nMalformed request".to_vec(),
-            
+
             health_complete,
             health_headers_only,
             ready_complete,
             ready_headers_only,
         }
     }
-    
-    
-    fn create_health_response() -> (Vec<u8>, Vec<u8>) {
-        let body = br#"{"status":"healthy","timestamp":"0"}"#;
+
+    fn create_json_response(body: &[u8]) -> (Vec<u8>, Vec<u8>) {
         let headers = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nX-Content-Type-Options: nosniff\r\nConnection: keep-alive\r\n\r\n",
             body.len()
         ).into_bytes();
-        
-        // Create unified single-write responses
+
         let mut complete_response = Vec::with_capacity(headers.len() + body.len());
         complete_response.extend_from_slice(&headers);
         complete_response.extend_from_slice(body);
-        
-        (complete_response, headers)
-    }
-    
-    fn create_ready_response() -> (Vec<u8>, Vec<u8>) {
-        let body = br#"{"status":"ready","timestamp":"0"}"#;
-        let headers = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nX-Content-Type-Options: nosniff\r\nConnection: keep-alive\r\n\r\n",
-            body.len()
-        ).into_bytes();
-        
-        // Create unified single-write responses
-        let mut complete_response = Vec::with_capacity(headers.len() + body.len());
-        complete_response.extend_from_slice(&headers);
-        complete_response.extend_from_slice(body);
-        
+
         (complete_response, headers)
     }
 }
 
-// Optimized case-insensitive ASCII comparison using SIMD-friendly approach
 fn header_starts_with(header_line: &[u8], prefix: &[u8]) -> bool {
     if header_line.len() < prefix.len() {
         return false;
     }
     
-    // Direct byte comparison is faster for short prefixes
     for i in 0..prefix.len() {
-        let h = header_line[i];
-        let p = prefix[i];
-        if h != p && h.to_ascii_lowercase() != p.to_ascii_lowercase() {
+        if header_line[i].to_ascii_lowercase() != prefix[i] {
             return false;
         }
     }
     true
 }
 
-// Optimized case-insensitive contains check using Boyer-Moore-like approach
 fn header_contains(header_line: &[u8], substring: &[u8]) -> bool {
     if substring.is_empty() {
         return true;
@@ -226,22 +179,18 @@ fn header_contains(header_line: &[u8], substring: &[u8]) -> bool {
         return false;
     }
     
-    let first_char = substring[0].to_ascii_lowercase();
+    let first_char = substring[0];
     let mut i = 0;
-    
+
     while i <= header_line.len() - substring.len() {
-        // Quick first-byte check
         if header_line[i].to_ascii_lowercase() != first_char {
             i += 1;
             continue;
         }
-        
-        // Check remaining bytes
+
         let mut matches = true;
         for j in 1..substring.len() {
-            let h = header_line[i + j];
-            let s = substring[j];
-            if h != s && h.to_ascii_lowercase() != s.to_ascii_lowercase() {
+            if header_line[i + j].to_ascii_lowercase() != substring[j] {
                 matches = false;
                 break;
             }
@@ -255,18 +204,6 @@ fn header_contains(header_line: &[u8], substring: &[u8]) -> bool {
     false
 }
 
-// Helper function to read a line into a byte buffer
-async fn read_line_bytes(reader: &mut BufReader<&mut TcpStream>, buffer: &mut Vec<u8>) -> Result<usize, std::io::Error> {
-    let mut total_bytes = 0;
-    loop {
-        let bytes_read = reader.read_until(b'\n', buffer).await?;
-        total_bytes += bytes_read;
-        if bytes_read == 0 || buffer.ends_with(b"\n") {
-            break;
-        }
-    }
-    Ok(total_bytes)
-}
 
 // Fast header line trimming
 fn trim_header_line(line: &[u8]) -> &[u8] {
@@ -312,6 +249,63 @@ fn extract_header_value<'a>(line: &'a [u8], header_name: &[u8]) -> Option<&'a [u
     }
     
     Some(&value_bytes[start..])
+}
+
+// RFC 7232 weak ETag comparison: split on commas, strip W/ prefixes, compare opaque-tags
+fn etag_matches(if_none_match: &[u8], server_etag: &[u8]) -> bool {
+    if if_none_match == b"*" {
+        return true;
+    }
+
+    // Extract server opaque-tag (strip W/ prefix and quotes)
+    let server_tag = strip_etag_decoration(server_etag);
+
+    // Split on commas, trim each entry, compare
+    let mut start = 0;
+    let len = if_none_match.len();
+
+    while start < len {
+        // Skip whitespace
+        while start < len && (if_none_match[start] == b' ' || if_none_match[start] == b'\t') {
+            start += 1;
+        }
+        if start >= len {
+            break;
+        }
+
+        // Find end of this etag (next comma or end)
+        let mut end = start;
+        while end < len && if_none_match[end] != b',' {
+            end += 1;
+        }
+
+        // Trim trailing whitespace from this entry
+        let mut entry_end = end;
+        while entry_end > start && (if_none_match[entry_end - 1] == b' ' || if_none_match[entry_end - 1] == b'\t') {
+            entry_end -= 1;
+        }
+
+        let client_tag = strip_etag_decoration(&if_none_match[start..entry_end]);
+        if client_tag == server_tag {
+            return true;
+        }
+
+        start = end + 1;
+    }
+    false
+}
+
+fn strip_etag_decoration(etag: &[u8]) -> &[u8] {
+    let mut s = etag;
+    // Strip W/ prefix
+    if s.len() >= 2 && s[0] == b'W' && s[1] == b'/' {
+        s = &s[2..];
+    }
+    // Strip surrounding quotes
+    if s.len() >= 2 && s[0] == b'"' && s[s.len() - 1] == b'"' {
+        s = &s[1..s.len() - 1];
+    }
+    s
 }
 
 // Fast zero-allocation HTTP request line parser
@@ -363,13 +357,16 @@ fn discover_files_recursive(
     
     for entry in entries {
         let entry = entry?;
-        let metadata = entry.metadata()?;
-        
-        // Use OsStr to avoid unnecessary UTF-8 conversion until needed
+        let file_type = entry.file_type()?;
+
+        // Skip symlinks to prevent directory escape
+        if file_type.is_symlink() {
+            continue;
+        }
+
         let file_name_os = entry.file_name();
         let file_name = file_name_os.to_string_lossy();
-        
-        // Optimized path joining - pre-allocate with capacity
+
         let current_relative = if relative_path.is_empty() {
             file_name.to_string()
         } else {
@@ -379,10 +376,10 @@ fn discover_files_recursive(
             path.push_str(&file_name);
             path
         };
-        
-        if metadata.is_file() {
+
+        if file_type.is_file() {
             // Generate cache entry for this file
-            if let Ok(cache_entry) = generate_cache_entry(&entry.path(), &current_relative) {
+            if let Ok(cache_entry) = generate_cache_entry(&entry.path()) {
                 // Optimized URL path construction
                 let mut url_path = String::with_capacity(current_relative.len() + 1);
                 url_path.push('/');
@@ -391,7 +388,7 @@ fn discover_files_recursive(
                 // Cache entry - automatically handles trailing slashes and index.html mapping
                 cache.insert(&url_path, cache_entry);
             }
-        } else if metadata.is_dir() {
+        } else if file_type.is_dir() {
             // Recursively process directories
             discover_files_recursive(base_dir, &current_relative, cache)?;
         }
@@ -400,7 +397,7 @@ fn discover_files_recursive(
     Ok(())
 }
 
-fn generate_cache_entry(file_path: &std::path::Path, _relative_path: &str) -> Result<CacheEntry, Box<dyn std::error::Error>> {
+fn generate_cache_entry(file_path: &std::path::Path) -> Result<CacheEntry, Box<dyn std::error::Error>> {
     let file_metadata = metadata(file_path)?;
     let size = file_metadata.len();
     let last_modified_raw = file_metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
@@ -437,7 +434,7 @@ fn generate_cache_entry(file_path: &std::path::Path, _relative_path: &str) -> Re
     ).into_bytes();
     
     // Store header length for HEAD request slicing
-    let header_length = headers.len() as u16;
+    let header_length = headers.len();
     
     // Pre-combine headers + content for single write()
     let mut complete_response = Vec::with_capacity(headers.len() + content.len());
@@ -469,7 +466,6 @@ async fn main() {
     let port = config.port;
     let max_request_size = config.max_request_size;
     let static_dir = config.static_dir;
-    let connection_timeout_secs = config.connection_timeout_secs;
     let keepalive_timeout_secs = config.keepalive_timeout_secs;
     let bind_ip = config.bind_ip;
     
@@ -482,14 +478,13 @@ async fn main() {
         .expect("Failed to initialize file cache");
 
     // Run server with direct config values - true zero overhead
-    run_server(bind_ip, port, max_request_size, connection_timeout_secs, keepalive_timeout_secs).await;
+    run_server(bind_ip, port, max_request_size, keepalive_timeout_secs).await;
 }
 
 async fn run_server(
     bind_ip: String,
     port: u16,
     max_request_size: usize,
-    connection_timeout_secs: u64,
     keepalive_timeout_secs: u64,
 ) {
     let listener = TcpListener::bind(format!("{}:{}", bind_ip, port))
@@ -508,7 +503,6 @@ async fn run_server(
                         tokio::spawn(handle_connection(
                             stream,
                             max_request_size,
-                            connection_timeout_secs,
                             keepalive_timeout_secs,
                         ));
                     }
@@ -551,101 +545,82 @@ async fn shutdown_signal() {
 }
 
 async fn handle_connection(
-    mut stream: TcpStream,
+    stream: TcpStream,
     max_request_size: usize,
-    _connection_timeout_secs: u64,
     keepalive_timeout_secs: u64,
 ) {
-    // Direct connection handling without double timeout
-    let _ = handle_connection_inner(&mut stream, max_request_size, keepalive_timeout_secs).await;
-}
+    let templates = HEADER_TEMPLATES.get().unwrap();
 
-async fn handle_connection_inner(
-    stream: &mut TcpStream,
-    max_request_size: usize,
-    keepalive_timeout_secs: u64,
-) {
-    // Pre-allocate buffers once per connection (not per request)
+    let (read_half, mut write_half) = tokio::io::split(stream);
+    let mut reader = BufReader::new(read_half);
+
+    // Pre-allocate buffers once per connection
     let mut request_line = Vec::with_capacity(512);
     let mut header_buffer = Vec::with_capacity(1024);
     let mut if_modified_since_buf = Vec::with_capacity(256);
     let mut if_none_match_buf = Vec::with_capacity(256);
-    
+
     loop {
-        // Check for shutdown
         if SHUTDOWN.load(Ordering::Relaxed) {
             break;
         }
 
-        // Clear buffers for reuse (eliminate per-request allocations)
         request_line.clear();
         header_buffer.clear();
         if_modified_since_buf.clear();
         if_none_match_buf.clear();
 
-        // Create fresh BufReader per request - optimal for brief line reading
-        let mut reader = BufReader::new(&mut *stream);
-
-        // Read request line with timeout - direct value, zero overhead
         match timeout(
             Duration::from_secs(keepalive_timeout_secs),
-            read_line_bytes(&mut reader, &mut request_line),
+            reader.read_until(b'\n', &mut request_line),
         )
         .await
         {
-            Ok(Ok(0)) | Err(_) => break, // Connection closed or timeout
-            Ok(Err(_)) => break,         // Read error
+            Ok(Ok(0)) | Err(_) => break,
+            Ok(Err(_)) => break,
             Ok(Ok(size)) if size > max_request_size => {
-                let _ = stream.write_all(&HEADER_TEMPLATES.get().unwrap().request_too_large).await;
+                let _ = write_half.write_all(&templates.request_too_large).await;
                 break;
             }
             Ok(Ok(_)) => {}
         }
 
-        if trim_header_line(&request_line).is_empty() {
-            continue; // Keep-alive, wait for next request
-        }
-
-        // Zero-allocation HTTP parsing - avoid string splits and allocations
         let request_bytes = trim_header_line(&request_line);
+        if request_bytes.is_empty() {
+            continue;
+        }
         let (method, path, version) = match parse_request_line_fast(request_bytes) {
             Some((m, p, v)) => (m, p, v),
             None => {
-                let _ = stream.write_all(&HEADER_TEMPLATES.get().unwrap().bad_request).await;
+                let _ = write_half.write_all(&templates.bad_request).await;
                 break;
             }
         };
 
         if method != b"GET" && method != b"HEAD" {
-            let _ = stream.write_all(&HEADER_TEMPLATES.get().unwrap().method_not_allowed).await;
+            let _ = write_half.write_all(&templates.method_not_allowed).await;
             break;
         }
 
-
-        // Enhanced connection management - faster header parsing
-        let mut keep_alive = version == "HTTP/1.1"; // Default for HTTP/1.1
+        let mut keep_alive = version == "HTTP/1.1";
         let mut if_modified_since: Option<&[u8]> = None;
         let mut if_none_match: Option<&[u8]> = None;
-        
-        // Optimized header parsing with zero allocations
+
         loop {
-            header_buffer.clear(); // Reuse vec, just clear content
-            
-            // Read header line into byte buffer
-            match read_line_bytes(&mut reader, &mut header_buffer).await {
-                Ok(0) => break, // Connection closed
+            header_buffer.clear();
+
+            match reader.read_until(b'\n', &mut header_buffer).await {
+                Ok(0) => break,
                 Ok(_) => {
                     if header_buffer.is_empty() || (header_buffer.len() == 2 && header_buffer == b"\r\n") {
-                        break; // End of headers
+                        break;
                     }
-                    
-                    // Trim CRLF and whitespace
+
                     let line = trim_header_line(&header_buffer);
                     if line.is_empty() {
                         break;
                     }
-                    
-                    // Optimized header parsing using byte slices
+
                     if header_starts_with(line, b"connection:") {
                         let connection_close_requested = header_contains(line, b"close");
                         keep_alive = !connection_close_requested && (version == "HTTP/1.1" || header_contains(line, b"keep-alive"));
@@ -667,11 +642,9 @@ async fn handle_connection_inner(
             }
         }
 
-        // Fast method detection and request handling
         let is_head = method == b"HEAD";
-        
-        // Direct stream usage for optimal response performance
-        if handle_request(stream, path, is_head, if_modified_since, if_none_match).await {
+
+        if handle_request(&mut write_half, path, is_head, if_modified_since, if_none_match).await {
             if !keep_alive {
                 break;
             }
@@ -683,80 +656,62 @@ async fn handle_connection_inner(
 
 
 async fn handle_request(
-    stream: &mut TcpStream,
+    writer: &mut WriteHalf<TcpStream>,
     path: &str,
     is_head: bool,
     if_modified_since: Option<&[u8]>,
     if_none_match: Option<&[u8]>,
 ) -> bool {
-    // Handle health check endpoints using unified response pattern
     let templates = HEADER_TEMPLATES.get().unwrap();
-    
-    // Unified single-write pattern for health endpoints
+
     if path == "/health" {
         let result = if is_head {
-            stream.write_all(&templates.health_headers_only).await
+            writer.write_all(&templates.health_headers_only).await
         } else {
-            stream.write_all(&templates.health_complete).await
+            writer.write_all(&templates.health_complete).await
         };
         return result.is_ok();
     }
 
     if path == "/ready" {
         let result = if is_head {
-            stream.write_all(&templates.ready_headers_only).await
+            writer.write_all(&templates.ready_headers_only).await
         } else {
-            stream.write_all(&templates.ready_complete).await
+            writer.write_all(&templates.ready_complete).await
         };
         return result.is_ok();
     }
 
-    // Fast path lookup with integrated query handling in FileCache
     let file_cache = FILE_CACHE.get().unwrap();
-    
-    // Direct path lookup - query parameters handled in hash computation
     let cache_entry = file_cache.get(path);
 
-    // Handle file from cache or 404
     if let Some(cache_entry) = cache_entry {
-        // Fast conditional request handling with If-Modified-Since check first
         if let Some(if_modified_since_bytes) = if_modified_since {
-            // Convert bytes to string only when needed for parsing
             if let Ok(if_modified_since_str) = std::str::from_utf8(if_modified_since_bytes) {
                 if let Ok(client_time) = httpdate::parse_http_date(if_modified_since_str) {
                     if cache_entry.last_modified_timestamp <= client_time {
-                        // Fast path: Use pre-generated 304 response
-                        let result = stream.write_all(&cache_entry.not_modified_response).await;
+                        let result = writer.write_all(&cache_entry.not_modified_response).await;
                         return result.is_ok();
                     }
                 }
             }
         }
-        
-        // Fast conditional request handling (immutable files = simple ETag check)
+
         if let Some(client_etag_bytes) = if_none_match {
-            // Perform direct byte comparison for ETag matching
-            let etag_bytes = cache_entry.etag.as_bytes();
-            if client_etag_bytes == b"*" || 
-               (client_etag_bytes.windows(etag_bytes.len()).any(|window| window == etag_bytes)) {
-                // Fast path: Use pre-generated 304 response
-                let result = stream.write_all(&cache_entry.not_modified_response).await;
+            if etag_matches(client_etag_bytes, cache_entry.etag.as_bytes()) {
+                let result = writer.write_all(&cache_entry.not_modified_response).await;
                 return result.is_ok();
             }
         }
 
-        // Single write operation - minimal system calls
         let result = if is_head {
-            // HEAD request: Send headers only via slice (zero-copy, single write)
-            stream.write_all(&cache_entry.complete_response[..cache_entry.header_length as usize]).await
+            writer.write_all(&cache_entry.complete_response[..cache_entry.header_length]).await
         } else {
-            // GET request: Send complete response (headers + content in single write!)
-            stream.write_all(&cache_entry.complete_response).await
+            writer.write_all(&cache_entry.complete_response).await
         };
         result.is_ok()
     } else {
-        // File not in cache - return 404
-        let result = stream.write_all(&HEADER_TEMPLATES.get().unwrap().not_found).await;
+        let result = writer.write_all(&templates.not_found).await;
         result.is_ok()
     }
 }
