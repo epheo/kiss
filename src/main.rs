@@ -5,7 +5,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::SystemTime;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::net::tcp::OwnedWriteHalf;
 use tokio::signal;
 use tokio::time::{timeout, Duration};
 use std::sync::OnceLock;
@@ -545,119 +544,266 @@ async fn shutdown_signal() {
     }
 }
 
+/// Parsed request as byte offsets into the source buffer — no borrows, no allocations
+struct ParsedRequest {
+    consumed: usize,
+    is_head: bool,
+    keep_alive: bool,
+    path_start: usize,
+    path_end: usize,
+    if_modified_since: Option<(usize, usize)>,
+    if_none_match: Option<(usize, usize)>,
+}
+
+/// Synchronously parse a complete HTTP request from a buffer using byte offsets.
+fn parse_request_from_buf(buf: &[u8], max_request_size: usize) -> Result<ParsedRequest, RequestError> {
+    if buf.len() > max_request_size {
+        return Err(RequestError::TooLarge);
+    }
+
+    let header_end = find_header_end(buf).ok_or(RequestError::Incomplete)?;
+    let consumed = header_end + 4;
+
+    let req_line_end = memchr_byte(b'\n', buf).ok_or(RequestError::Malformed)?;
+    let request_line = trim_header_line(&buf[..req_line_end]);
+    if request_line.is_empty() {
+        return Err(RequestError::Malformed);
+    }
+
+    let (method, path, version) = parse_request_line_fast(request_line)
+        .ok_or(RequestError::Malformed)?;
+
+    if method != b"GET" && method != b"HEAD" {
+        return Err(RequestError::MethodNotAllowed);
+    }
+
+    // Compute path byte offsets relative to buf
+    let path_bytes = path.as_bytes();
+    let path_start = path_bytes.as_ptr() as usize - buf.as_ptr() as usize;
+    let path_end = path_start + path_bytes.len();
+
+    let mut keep_alive = version == "HTTP/1.1";
+    let mut if_modified_since: Option<(usize, usize)> = None;
+    let mut if_none_match: Option<(usize, usize)> = None;
+
+    let mut pos = req_line_end + 1;
+    while pos < header_end {
+        let line_end = match memchr_byte(b'\n', &buf[pos..header_end]) {
+            Some(offset) => pos + offset,
+            None => header_end,
+        };
+
+        let line = trim_header_line(&buf[pos..line_end]);
+        pos = line_end + 1;
+
+        if line.is_empty() {
+            continue;
+        }
+
+        if header_starts_with(line, b"connection:") {
+            let connection_close_requested = header_contains(line, b"close");
+            keep_alive = !connection_close_requested && (version == "HTTP/1.1" || header_contains(line, b"keep-alive"));
+        } else if header_starts_with(line, b"if-modified-since:") {
+            if let Some(value) = extract_header_value(line, b"if-modified-since:") {
+                let start = value.as_ptr() as usize - buf.as_ptr() as usize;
+                if_modified_since = Some((start, start + value.len()));
+            }
+        } else if header_starts_with(line, b"if-none-match:") {
+            if let Some(value) = extract_header_value(line, b"if-none-match:") {
+                let start = value.as_ptr() as usize - buf.as_ptr() as usize;
+                if_none_match = Some((start, start + value.len()));
+            }
+        }
+    }
+
+    Ok(ParsedRequest {
+        consumed,
+        is_head: method == b"HEAD",
+        keep_alive,
+        path_start,
+        path_end,
+        if_modified_since,
+        if_none_match,
+    })
+}
+
+enum RequestError {
+    Incomplete,
+    TooLarge,
+    Malformed,
+    MethodNotAllowed,
+}
+
+/// Find \r\n\r\n in buffer, return index of first \r
+#[inline]
+fn find_header_end(buf: &[u8]) -> Option<usize> {
+    if buf.len() < 4 {
+        return None;
+    }
+    let mut i = 0;
+    let end = buf.len() - 3;
+    while i < end {
+        if buf[i] == b'\r' && buf[i + 1] == b'\n' && buf[i + 2] == b'\r' && buf[i + 3] == b'\n' {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+#[inline]
+fn memchr_byte(needle: u8, haystack: &[u8]) -> Option<usize> {
+    haystack.iter().position(|&b| b == needle)
+}
+
+/// Extract request fields from buffer using offsets, returning owned data for dispatch.
+/// Per-connection buffers are reused via clear() to avoid allocation.
+fn extract_request_fields(
+    buf: &[u8],
+    parsed: &ParsedRequest,
+    path_buf: &mut String,
+    ims_buf: &mut Vec<u8>,
+    inm_buf: &mut Vec<u8>,
+) {
+    path_buf.clear();
+    ims_buf.clear();
+    inm_buf.clear();
+
+    // Safety: parse_request_line_fast already validated path as UTF-8
+    let path_bytes = &buf[parsed.path_start..parsed.path_end];
+    path_buf.push_str(unsafe { std::str::from_utf8_unchecked(path_bytes) });
+
+    if let Some((start, end)) = parsed.if_modified_since {
+        ims_buf.extend_from_slice(&buf[start..end]);
+    }
+    if let Some((start, end)) = parsed.if_none_match {
+        inm_buf.extend_from_slice(&buf[start..end]);
+    }
+}
+
 async fn handle_connection(
     stream: TcpStream,
     max_request_size: usize,
     keepalive_timeout_secs: u64,
 ) {
     let templates = HEADER_TEMPLATES.get().unwrap();
+    let mut stream = BufReader::new(stream);
 
-    let (read_half, mut write_half) = stream.into_split();
-    let mut reader = BufReader::new(read_half);
-
-    // Pre-allocate buffers once per connection
-    let mut request_line = Vec::with_capacity(512);
-    let mut header_buffer = Vec::with_capacity(1024);
-    let mut if_modified_since_buf = Vec::with_capacity(256);
-    let mut if_none_match_buf = Vec::with_capacity(256);
+    // Per-connection reusable buffers for extracted request data
+    let mut path_buf = String::with_capacity(256);
+    let mut ims_buf = Vec::with_capacity(64);
+    let mut inm_buf = Vec::with_capacity(128);
 
     loop {
         if SHUTDOWN.load(Ordering::Relaxed) {
             break;
         }
 
-        request_line.clear();
-        header_buffer.clear();
-        if_modified_since_buf.clear();
-        if_none_match_buf.clear();
-
-        match timeout(
+        // Single async read to fill the internal buffer
+        let parse_result = match timeout(
             Duration::from_secs(keepalive_timeout_secs),
-            reader.read_until(b'\n', &mut request_line),
+            stream.fill_buf(),
         )
         .await
         {
-            Ok(Ok(0)) | Err(_) => break,
-            Ok(Err(_)) => break,
-            Ok(Ok(size)) if size > max_request_size => {
-                let _ = write_half.write_all(&templates.request_too_large).await;
-                break;
-            }
-            Ok(Ok(_)) => {}
-        }
-
-        let request_bytes = trim_header_line(&request_line);
-        if request_bytes.is_empty() {
-            continue;
-        }
-        let (method, path, version) = match parse_request_line_fast(request_bytes) {
-            Some((m, p, v)) => (m, p, v),
-            None => {
-                let _ = write_half.write_all(&templates.bad_request).await;
-                break;
-            }
+            Ok(Ok(buf)) if !buf.is_empty() => parse_request_from_buf(buf, max_request_size),
+            _ => break,
         };
 
-        if method != b"GET" && method != b"HEAD" {
-            let _ = write_half.write_all(&templates.method_not_allowed).await;
-            break;
-        }
+        match parse_result {
+            Ok(parsed) => {
+                // Re-borrow buffer to extract fields before consuming
+                {
+                    let buf = stream.buffer();
+                    extract_request_fields(buf, &parsed, &mut path_buf, &mut ims_buf, &mut inm_buf);
+                }
+                stream.consume(parsed.consumed);
 
-        let mut keep_alive = version == "HTTP/1.1";
-        let mut if_modified_since: Option<&[u8]> = None;
-        let mut if_none_match: Option<&[u8]> = None;
+                let ims = if ims_buf.is_empty() { None } else { Some(ims_buf.as_slice()) };
+                let inm = if inm_buf.is_empty() { None } else { Some(inm_buf.as_slice()) };
 
-        loop {
-            header_buffer.clear();
-
-            match reader.read_until(b'\n', &mut header_buffer).await {
-                Ok(0) => break,
-                Ok(_) => {
-                    if header_buffer.is_empty() || (header_buffer.len() == 2 && header_buffer == b"\r\n") {
+                if handle_request(&mut stream, &path_buf, parsed.is_head, ims, inm).await {
+                    if !parsed.keep_alive {
                         break;
                     }
+                } else {
+                    break;
+                }
+            }
+            Err(RequestError::Incomplete) => {
+                // Headers span multiple TCP segments — accumulate into owned buffer
+                let mut accumulated = Vec::with_capacity(max_request_size);
+                accumulated.extend_from_slice(stream.buffer());
+                let buf_len = accumulated.len();
+                stream.consume(buf_len);
 
-                    let line = trim_header_line(&header_buffer);
-                    if line.is_empty() {
-                        break;
+                loop {
+                    let more = match stream.fill_buf().await {
+                        Ok(b) if !b.is_empty() => b,
+                        _ => break,
+                    };
+                    accumulated.extend_from_slice(more);
+                    let more_len = more.len();
+                    stream.consume(more_len);
+
+                    if accumulated.len() > max_request_size {
+                        let _ = stream.write_all(&templates.request_too_large).await;
+                        return;
                     }
 
-                    if header_starts_with(line, b"connection:") {
-                        let connection_close_requested = header_contains(line, b"close");
-                        keep_alive = !connection_close_requested && (version == "HTTP/1.1" || header_contains(line, b"keep-alive"));
-                    } else if header_starts_with(line, b"if-modified-since:") {
-                        if let Some(value) = extract_header_value(line, b"if-modified-since:") {
-                            if_modified_since_buf.clear();
-                            if_modified_since_buf.extend_from_slice(value);
-                            if_modified_since = Some(&if_modified_since_buf);
-                        }
-                    } else if header_starts_with(line, b"if-none-match:") {
-                        if let Some(value) = extract_header_value(line, b"if-none-match:") {
-                            if_none_match_buf.clear();
-                            if_none_match_buf.extend_from_slice(value);
-                            if_none_match = Some(&if_none_match_buf);
-                        }
+                    if find_header_end(&accumulated).is_some() {
+                        break;
                     }
                 }
-                Err(_) => break,
+
+                match parse_request_from_buf(&accumulated, max_request_size) {
+                    Ok(parsed) => {
+                        extract_request_fields(&accumulated, &parsed, &mut path_buf, &mut ims_buf, &mut inm_buf);
+
+                        let ims = if ims_buf.is_empty() { None } else { Some(ims_buf.as_slice()) };
+                        let inm = if inm_buf.is_empty() { None } else { Some(inm_buf.as_slice()) };
+
+                        if handle_request(&mut stream, &path_buf, parsed.is_head, ims, inm).await {
+                            if !parsed.keep_alive {
+                                break;
+                            }
+                        } else {
+                            break;
+                        }
+                    }
+                    Err(RequestError::TooLarge) => {
+                        let _ = stream.write_all(&templates.request_too_large).await;
+                        break;
+                    }
+                    Err(RequestError::MethodNotAllowed) => {
+                        let _ = stream.write_all(&templates.method_not_allowed).await;
+                        break;
+                    }
+                    Err(_) => {
+                        let _ = stream.write_all(&templates.bad_request).await;
+                        break;
+                    }
+                }
             }
-        }
-
-        let is_head = method == b"HEAD";
-
-        if handle_request(&mut write_half, path, is_head, if_modified_since, if_none_match).await {
-            if !keep_alive {
+            Err(RequestError::TooLarge) => {
+                let _ = stream.write_all(&templates.request_too_large).await;
                 break;
             }
-        } else {
-            break;
+            Err(RequestError::MethodNotAllowed) => {
+                let _ = stream.write_all(&templates.method_not_allowed).await;
+                break;
+            }
+            Err(RequestError::Malformed) => {
+                let _ = stream.write_all(&templates.bad_request).await;
+                break;
+            }
         }
     }
 }
 
 
 async fn handle_request(
-    writer: &mut OwnedWriteHalf,
+    writer: &mut BufReader<TcpStream>,
     path: &str,
     is_head: bool,
     if_modified_since: Option<&[u8]>,
