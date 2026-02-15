@@ -14,7 +14,7 @@ path = "src/main.rs"
 [dependencies]
 tokio = { version = "1.0", features = ["rt-multi-thread", "net", "io-util", "signal", "time", "macros"] }
 httpdate = "1.0"
-rustc-hash = "1.1"
+rustc-hash = "2.0"
 clap = { version = "4.0", features = ["derive", "env"] }
 
 [dev-dependencies]

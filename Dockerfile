@@ -1,5 +1,5 @@
 # Multi-stage build for minimal container
-FROM rust:1.75-alpine AS builder
+FROM rust:1.93-alpine AS builder
 
 # Install musl target for static linking
 RUN apk add --no-cache musl-dev
