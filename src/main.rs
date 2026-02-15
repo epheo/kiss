@@ -3,8 +3,9 @@ use rustc_hash::FxHashMap;
 use std::fs::{read_dir, metadata, read};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::SystemTime;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, WriteHalf};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::net::tcp::OwnedWriteHalf;
 use tokio::signal;
 use tokio::time::{timeout, Duration};
 use std::sync::OnceLock;
@@ -551,7 +552,7 @@ async fn handle_connection(
 ) {
     let templates = HEADER_TEMPLATES.get().unwrap();
 
-    let (read_half, mut write_half) = tokio::io::split(stream);
+    let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
 
     // Pre-allocate buffers once per connection
@@ -656,7 +657,7 @@ async fn handle_connection(
 
 
 async fn handle_request(
-    writer: &mut WriteHalf<TcpStream>,
+    writer: &mut OwnedWriteHalf,
     path: &str,
     is_head: bool,
     if_modified_since: Option<&[u8]>,

@@ -6,10 +6,10 @@
 set -e
 
 # Configuration
-KISS_URL="http://localhost:8080"
-NGINX_URL="http://localhost:80"
+KISS_URL="${KISS_URL:-http://localhost:8080}"
+NGINX_URL="${NGINX_URL:-http://localhost:80}"
 DURATION=10
-THREADS=4
+THREADS=8
 LOG_DIR="benchmark_results"
 
 # Colors for output
