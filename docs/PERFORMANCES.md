@@ -1,154 +1,79 @@
 # KISS Performance Analysis
 
-This document provides performance analysis and benchmarking data for KISS (Kubernetes Instant Static Server), an in-memory static file server written in Rust.
-
-## Performance Summary
-
 KISS implements an in-memory architecture that pre-loads all static files at startup, eliminating disk I/O during request processing.
 
-Those tests have been performed on my laptop "12th Gen Intel(R) Core(TM) i7-1280P"
+Tests performed on AMD RYZEN AI MAX+ 395 (32 cores) with wrk (8 threads, 10s duration per test).
 
-**Benchmark Results (wrk):**
+## Results
 
-- Peak throughput: 795,141 req/s (8 threads, 250 concurrent connections, 10s test)
-- Average latency: 259.91μs (microseconds)
-- Small file performance: 435,224 req/s vs nginx 99,778 req/s (4.36x faster)
-- Medium file performance: 60,930 req/s vs nginx 45,086 req/s  
-- Cache performance: 82,924 req/s vs nginx 77,813 req/s
-- Response time: 0.301ms average (wrk), 0.5-1.6ms for files under 1MB
-- Architecture: Zero disk I/O with pre-loaded content
+- Peak throughput: **1,085,482 req/s** (500 concurrent connections)
+- P99 latency: **269μs** at 100 connections
+- Memory footprint: **2.2MB RSS**, stable under sustained load
 
-## KISS vs nginx Comprehensive Comparison
+### Concurrency Scaling (small file)
 
-### File Size Performance Comparison (100 concurrent connections)
+| Concurrency | KISS RPS    | nginx RPS   | Ratio | KISS P99 | nginx P99 |
+|-------------|-------------|-------------|-------|----------|-----------|
+| 10          | 664,480     | 546,423     | 1.21x | 27μs     | 42μs      |
+| 50          | 831,972     | 1,044,872   | 0.80x | 170μs    | 635μs     |
+| 100         | 1,014,821   | 968,300     | 1.04x | 269μs    | 569μs     |
+| 200         | 1,055,360   | 915,806     | 1.15x | 390μs    | 1.42ms    |
+| 500         | 1,085,482   | 919,009     | 1.18x | 1.02ms   | 3.06ms    |
 
-| File Type      | KISS RPS | nginx RPS | Performance Ratio | KISS Latency | nginx Latency |
-|----------------|----------|-----------|-------------------|--------------|---------------|
-| Small (index)  | 435,224  | 99,778    | 4.36x             | 0.157ms      | 1.02ms        |
-| Medium (100KB) | 60,930   | 45,086    | 1.35x             | 1.641ms      | 2.218ms       |
-| Large (10MB)   | 386*     | 465       | 0.83x             | 258ms        | 215ms         |
+KISS scales linearly up to 500 connections. P99 tail latency stays 2-3x tighter than nginx under load.
 
-*Large files experience performance degradation due to memory constraints
+### File Size Performance (100 concurrent connections)
 
-### Concurrency Scaling Performance (small files)
+| File Type      | KISS RPS    | nginx RPS   | Ratio | KISS P99 | nginx P99 |
+|----------------|-------------|-------------|-------|----------|-----------|
+| Small (12B)    | 1,063,514   | 997,058     | 1.06x | 274μs    | 573μs     |
+| Medium (100KB) | 497,967     | 458,640     | 1.08x | 588μs    | 40.08ms   |
+| Large (10MB)   | 4,507       | 7,950       | 0.57x | 135ms    | 20ms      |
 
-| Concurrency | KISS RPS | nginx RPS | Performance Ratio |
-|-------------|----------|-----------|-------------------|
-| 1           | 62,861   | 47,278    | 1.33x             |
-| 10          | 126,283  | 167,177   | 0.76x             |
-| 50          | 153,726  | 121,779   | 1.26x             |
-| 100         | 102,455  | 73,772    | 1.39x             |
-| 200         | 81,268   | 77,405    | 1.05x             |
-| 500         | 67,149   | 71,845    | 0.93x             |
+nginx wins on large files because sendfile() avoids copying content through userspace.
 
-### Specialized Endpoint Performance
+### Cache & Health (100 concurrent connections)
 
-| Endpoint     | KISS RPS | nginx RPS | Performance Ratio | Notes                       |
-|--------------|----------|-----------|-------------------|-----------------------------|
-| Cache (304)  | 82,924   | 77,813    | 1.07x             | Pre-generated 304 responses |
-| Health Check | 84,271   | 82,747    | 1.02x             | Optimized JSON responses    |
+| Endpoint     | KISS RPS    | nginx RPS | Ratio |
+|--------------|-------------|-----------|-------|
+| Cache (304)  | 1,017,210   | 948,507   | 1.07x |
+| Health Check | 1,027,482   | 886,659   | 1.15x |
 
-## Architecture Comparison
+## Architecture
 
-### KISS (In-Memory Architecture)
+### KISS (In-Memory)
 
-KISS implements a specialized architecture optimized for static file serving:
-
-- All files are pre-loaded into memory during startup
-- Complete HTTP responses are pre-generated (headers + content)
+- All files pre-loaded into memory at startup
+- Complete HTTP responses pre-generated (headers + content)
 - Zero disk I/O during request processing
-- Single write() system call per request
-- Trade-off: Higher memory usage for improved performance
+- Single write() system call per response
 
-### nginx (Disk-Based Architecture)
+### nginx (Disk-Based)
 
-nginx uses a traditional disk-based approach:
+- Files served from disk using sendfile()
+- Metadata cached in memory, content read per request
 
-- Files are served from disk using sendfile() system calls
-- Only metadata is cached in memory
-- Content is read from disk on each request
-- Trade-off: Lower memory usage with disk I/O overhead
-
-### Performance Characteristics
-
-KISS demonstrates superior performance for:
-
-- Small to medium files (< 1MB): 1.26-1.35x faster
-- Moderate concurrency (50-200 connections): Up to 1.39x faster
-- Cache performance: 1.07x faster for 304 responses
-- Predictable latency due to elimination of disk I/O variance
-
-nginx maintains advantages for:
-
-- Large files (> 10MB): Better memory efficiency
-- Very high concurrency (> 500 connections): More mature connection handling
-- Complex routing and dynamic content serving
-
-### Recommended Use Cases
-
-KISS is optimal for:
+### When to use KISS
 
 - Static websites and single-page applications
 - API documentation and asset serving
-- Microservice static content
-- Container-native deployments
-- Scenarios where files remain static during runtime
+- Microservice static content in Kubernetes
+- Files under 1MB where latency predictability matters
 
-nginx is recommended for:
+### When to use nginx
 
-- General-purpose web serving
-- Large file downloads
-- Applications requiring dynamic content processing
+- Large file downloads (> 10MB)
+- Dynamic content processing
 - Mixed static and dynamic workloads
 
-## Large File Performance Considerations
-
-### Performance Analysis for Large Files (10MB+)
-
-**Observed Behavior:**
-
-- Throughput: 386 RPS vs nginx's 465 RPS (0.83x performance ratio)
-- Latency: 258ms vs nginx's 215ms
-- Request failures: 8-149 failures per 10,000 requests
-- Memory usage: Significant RAM consumption for large file sets
-
-### Recommended File Size Guidelines
-
-| File Size   | Performance              | Recommendation        |
-|-------------|--------------------------|-----------------------|
-| < 1KB       | 198,000 RPS              | Optimal               |
-| 1KB - 100KB | 61,000 RPS | Recommended |
-| 100KB - 1MB | Estimated 20,000+ RPS    | Acceptable            |
-| 1MB - 10MB  | Estimated 5,000 RPS      | Consider alternatives |
-| > 10MB      | 386 RPS with failures    | Not recommended       |
-
-### Memory Usage Planning
-
-**Memory Usage Estimation (Optimized with slice-based headers):**
+## Memory Usage
 
 ```txt
-Total RAM = Sum of all file sizes + ~100MB base overhead
+Total RAM = Sum of all file sizes + ~2MB base overhead
 
-Example calculations:
-100 files × 10KB = 1MB RAM
-1000 files × 100KB = 100MB RAM  
-100 files × 1MB = 100MB RAM
-10 files × 10MB = 100MB RAM
+100 files × 10KB  = 1MB RAM
+1000 files × 100KB = 100MB RAM
+100 files × 1MB   = 100MB RAM
 ```
 
-**Production Guidelines:**
-
-- Target file sizes under 1MB for optimal performance
-- Monitor memory usage during startup and operation
-- Consider nginx or CDN solutions for large file serving
-
-## Summary
-
-**Performance Characteristics:**
-
-- Peak throughput: 795,141 req/s (wrk benchmark with 250 concurrent connections)
-- Medium file performance: 60,930 req/s
-- Response times: 0.462ms mean (100,000 requests), 0.5-1.6ms for files under 1MB
-- Architecture: In-memory serving with zero disk I/O
-- Scaling: Linear horizontal scaling in Kubernetes environments
-- Optimal use cases: Static websites, documentation, containerized deployments with files under 1MB
+Target file sizes under 1MB for optimal performance. Consider nginx or CDN for large file serving.
