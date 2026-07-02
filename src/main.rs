@@ -1,15 +1,14 @@
 use clap::Parser;
+use kiss::mime_type;
 use rustc_hash::FxHashMap;
-use std::fs::{read_dir, metadata, read};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::fs::{metadata, read, read_dir};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::SystemTime;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::signal;
-use tokio::time::{timeout, Duration};
-use std::sync::OnceLock;
-use std::sync::Arc;
-use kiss::get_mime_type_enum;
+use tokio::time::{sleep, timeout, Duration, Instant};
 
 /// KISS (Kubernetes Instant Static Server) - A fast static file server
 #[derive(Parser)]
@@ -28,7 +27,7 @@ struct Config {
     static_dir: String,
 
     /// Keep-alive timeout in seconds
-    #[arg(short = 'k', long, env = "KISS_KEEPALIVE_TIMEOUT", default_value_t = 5)]
+    #[arg(short = 'k', long, env = "KISS_KEEPALIVE_TIMEOUT", default_value_t = 5, value_parser = clap::value_parser!(u64).range(1..))]
     keepalive_timeout_secs: u64,
 
     /// IP address to bind the server to
@@ -36,19 +35,33 @@ struct Config {
     bind_ip: String,
 }
 
-static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+/// Files larger than this are skipped at cache build time to bound memory usage
+const MAX_FILE_SIZE: u64 = 50 * 1024 * 1024;
 
-// Cache entry for static files
-#[derive(Clone, Debug)]
-struct CacheEntry {
-    complete_response: Arc<[u8]>,        // Pre-generated complete HTTP response
-    header_length: usize,                 // Where content starts in complete_response
-    not_modified_response: Arc<[u8]>,    // Pre-generated 304 response
-    last_modified_timestamp: SystemTime, // For conditional requests
-    etag: Arc<str>,                      // For ETag validation
+static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+static ACTIVE_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
+
+/// Decrements the connection count when a connection task finishes, so
+/// shutdown can wait for in-flight requests to drain.
+struct ConnGuard;
+
+impl Drop for ConnGuard {
+    fn drop(&mut self) {
+        ACTIVE_CONNECTIONS.fetch_sub(1, Ordering::Release);
+    }
 }
 
-#[derive(Debug, Clone)]
+// Cache entry for static files
+#[derive(Clone)]
+struct CacheEntry {
+    complete_response: Arc<[u8]>,        // Pre-generated complete HTTP response
+    header_length: usize,                // Where content starts in complete_response
+    not_modified_response: Arc<[u8]>,    // Pre-generated 304 response
+    etag: Arc<str>,                      // For ETag validation
+    last_modified_str: Arc<str>,         // Pre-formatted Last-Modified value for fast comparison
+    last_modified_timestamp: SystemTime, // For conditional requests
+}
+
 struct FileCache {
     entries: FxHashMap<Box<str>, CacheEntry>,
 }
@@ -64,40 +77,30 @@ impl FileCache {
     #[inline]
     fn normalize_path(path: &str) -> &str {
         let bytes = path.as_bytes();
-        let mut end = bytes.len();
-
-        for (i, &b) in bytes.iter().enumerate() {
-            if b == b'?' {
-                end = i;
-                break;
-            }
-        }
-
+        let mut end = bytes.iter().position(|&b| b == b'?').unwrap_or(bytes.len());
         if end > 1 && bytes[end - 1] == b'/' {
             end -= 1;
         }
-
         &path[..end]
     }
 
     fn insert(&mut self, path: &str, entry: CacheEntry) {
-        let norm = Self::normalize_path(path);
-        self.entries.insert(Box::from(norm), entry.clone());
+        self.entries
+            .insert(Box::from(Self::normalize_path(path)), entry.clone());
 
-        if path.ends_with("/index.html") {
-            let dir_path = &path[..path.len() - 11];
-            let dir_norm = if dir_path.is_empty() { "/" } else { Self::normalize_path(dir_path) };
-            self.entries.insert(Box::from(dir_norm), entry.clone());
-
-            if path == "/index.html" {
-                self.entries.insert(Box::from("/"), entry);
-            }
+        // "/dir/index.html" is also served at "/dir" ("/" for the root index)
+        if let Some(dir_path) = path.strip_suffix("/index.html") {
+            let dir_norm = if dir_path.is_empty() {
+                "/"
+            } else {
+                Self::normalize_path(dir_path)
+            };
+            self.entries.insert(Box::from(dir_norm), entry);
         }
     }
 
     fn get(&self, path: &str) -> Option<&CacheEntry> {
-        let norm = Self::normalize_path(path);
-        self.entries.get(norm)
+        self.entries.get(Self::normalize_path(path))
     }
 
     fn entry_count(&self) -> usize {
@@ -109,234 +112,214 @@ impl FileCache {
 static HEADER_TEMPLATES: OnceLock<HeaderTemplates> = OnceLock::new();
 static FILE_CACHE: OnceLock<FileCache> = OnceLock::new();
 
-// Pre-compiled response templates split into headers and bodies for unified handling
-#[derive(Debug)]
+// Pre-compiled responses: complete = headers + body, with the header length
+// kept where HEAD requests need a headers-only slice.
 struct HeaderTemplates {
-    // Error responses (headers + body combined for simplicity since they're small)
     not_found: Vec<u8>,
+    not_found_header_length: usize,
     method_not_allowed: Vec<u8>,
     request_too_large: Vec<u8>,
     bad_request: Vec<u8>,
-    
-    // Health endpoint responses (unified single-write pattern)
-    health_complete: Vec<u8>,
-    health_headers_only: Vec<u8>,
-    ready_complete: Vec<u8>,
-    ready_headers_only: Vec<u8>,
+    health: Vec<u8>,
+    health_header_length: usize,
+    ready: Vec<u8>,
+    ready_header_length: usize,
 }
 
 impl HeaderTemplates {
     fn new() -> Self {
-        let (health_complete, health_headers_only) = Self::create_json_response(br#"{"status":"healthy","timestamp":"0"}"#);
-        let (ready_complete, ready_headers_only) = Self::create_json_response(br#"{"status":"ready","timestamp":"0"}"#);
+        let (health, health_header_length) = Self::keep_alive_response(
+            "200 OK",
+            "application/json",
+            br#"{"status":"healthy","timestamp":"0"}"#,
+        );
+        let (ready, ready_header_length) = Self::keep_alive_response(
+            "200 OK",
+            "application/json",
+            br#"{"status":"ready","timestamp":"0"}"#,
+        );
+        let (not_found, not_found_header_length) =
+            Self::keep_alive_response("404 Not Found", "text/plain", b"File not found");
 
         Self {
-            not_found: b"HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nContent-Length: 14\r\nX-Content-Type-Options: nosniff\r\nConnection: keep-alive\r\n\r\nFile not found".to_vec(),
-            method_not_allowed: b"HTTP/1.1 405 Method Not Allowed\r\nContent-Type: text/plain\r\nContent-Length: 18\r\nX-Content-Type-Options: nosniff\r\nConnection: keep-alive\r\n\r\nMethod not allowed".to_vec(),
-            request_too_large: b"HTTP/1.1 413 Request Entity Too Large\r\nContent-Type: text/plain\r\nContent-Length: 17\r\nX-Content-Type-Options: nosniff\r\nConnection: keep-alive\r\n\r\nRequest too large".to_vec(),
-            bad_request: b"HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\nContent-Length: 17\r\nX-Content-Type-Options: nosniff\r\nConnection: keep-alive\r\n\r\nMalformed request".to_vec(),
-
-            health_complete,
-            health_headers_only,
-            ready_complete,
-            ready_headers_only,
+            not_found,
+            not_found_header_length,
+            // These errors always close the connection (the request boundary is
+            // unknown after a parse failure), so they advertise Connection: close.
+            method_not_allowed: b"HTTP/1.1 405 Method Not Allowed\r\nAllow: GET, HEAD\r\nContent-Type: text/plain\r\nContent-Length: 18\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\nMethod not allowed".to_vec(),
+            request_too_large: b"HTTP/1.1 413 Request Entity Too Large\r\nContent-Type: text/plain\r\nContent-Length: 17\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\nRequest too large".to_vec(),
+            bad_request: b"HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\nContent-Length: 17\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\nMalformed request".to_vec(),
+            health,
+            health_header_length,
+            ready,
+            ready_header_length,
         }
     }
 
-    fn create_json_response(body: &[u8]) -> (Vec<u8>, Vec<u8>) {
+    /// Build a complete keep-alive response plus its header length for HEAD slicing
+    fn keep_alive_response(status: &str, content_type: &str, body: &[u8]) -> (Vec<u8>, usize) {
         let headers = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nX-Content-Type-Options: nosniff\r\nConnection: keep-alive\r\n\r\n",
+            "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nX-Content-Type-Options: nosniff\r\nConnection: keep-alive\r\n\r\n",
             body.len()
-        ).into_bytes();
-
-        let mut complete_response = Vec::with_capacity(headers.len() + body.len());
-        complete_response.extend_from_slice(&headers);
-        complete_response.extend_from_slice(body);
-
-        (complete_response, headers)
+        );
+        let header_length = headers.len();
+        let mut complete = headers.into_bytes();
+        complete.extend_from_slice(body);
+        (complete, header_length)
     }
 }
 
-fn header_starts_with(header_line: &[u8], prefix: &[u8]) -> bool {
-    if header_line.len() < prefix.len() {
-        return false;
-    }
-    
-    for i in 0..prefix.len() {
-        if header_line[i].to_ascii_lowercase() != prefix[i] {
-            return false;
-        }
-    }
-    true
+#[inline]
+fn header_starts_with(line: &[u8], prefix: &[u8]) -> bool {
+    line.len() >= prefix.len() && line[..prefix.len()].eq_ignore_ascii_case(prefix)
 }
 
-fn header_contains(header_line: &[u8], substring: &[u8]) -> bool {
-    if substring.is_empty() {
-        return true;
-    }
-    
-    if header_line.len() < substring.len() {
-        return false;
-    }
-    
-    let first_char = substring[0];
-    let mut i = 0;
-
-    while i <= header_line.len() - substring.len() {
-        if header_line[i].to_ascii_lowercase() != first_char {
-            i += 1;
-            continue;
-        }
-
-        let mut matches = true;
-        for j in 1..substring.len() {
-            if header_line[i + j].to_ascii_lowercase() != substring[j] {
-                matches = false;
-                break;
-            }
-        }
-        
-        if matches {
-            return true;
-        }
-        i += 1;
-    }
-    false
+#[inline]
+fn header_contains(line: &[u8], needle: &[u8]) -> bool {
+    line.windows(needle.len())
+        .any(|window| window.eq_ignore_ascii_case(needle))
 }
 
-
-// Fast header line trimming
-fn trim_header_line(line: &[u8]) -> &[u8] {
-    let mut start = 0;
-    let mut end = line.len();
-    
-    // Trim trailing CRLF and whitespace
-    while end > 0 {
-        match line[end - 1] {
-            b'\r' | b'\n' | b' ' | b'\t' => end -= 1,
-            _ => break,
-        }
-    }
-    
-    // Trim leading whitespace
-    while start < end {
-        match line[start] {
-            b' ' | b'\t' => start += 1,
-            _ => break,
-        }
-    }
-    
-    &line[start..end]
+// Header value after "name:", with surrounding whitespace stripped
+fn extract_header_value<'a>(line: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
+    let value = line[name.len()..].trim_ascii_start();
+    (!value.is_empty()).then_some(value)
 }
 
-// Extract header value without allocation
-fn extract_header_value<'a>(line: &'a [u8], header_name: &[u8]) -> Option<&'a [u8]> {
-    if line.len() <= header_name.len() {
-        return None;
-    }
-    
-    let value_start = header_name.len();
-    let value_bytes = &line[value_start..];
-    
-    // Skip whitespace after colon
-    let mut start = 0;
-    while start < value_bytes.len() && (value_bytes[start] == b' ' || value_bytes[start] == b'\t') {
-        start += 1;
-    }
-    
-    if start >= value_bytes.len() {
-        return None;
-    }
-    
-    Some(&value_bytes[start..])
-}
-
-// RFC 7232 weak ETag comparison: split on commas, strip W/ prefixes, compare opaque-tags
+// RFC 7232 weak ETag comparison: match any comma-separated entry, ignoring
+// W/ prefixes and surrounding quotes
 fn etag_matches(if_none_match: &[u8], server_etag: &[u8]) -> bool {
     if if_none_match == b"*" {
         return true;
     }
-
-    // Extract server opaque-tag (strip W/ prefix and quotes)
     let server_tag = strip_etag_decoration(server_etag);
-
-    // Split on commas, trim each entry, compare
-    let mut start = 0;
-    let len = if_none_match.len();
-
-    while start < len {
-        // Skip whitespace
-        while start < len && (if_none_match[start] == b' ' || if_none_match[start] == b'\t') {
-            start += 1;
-        }
-        if start >= len {
-            break;
-        }
-
-        // Find end of this etag (next comma or end)
-        let mut end = start;
-        while end < len && if_none_match[end] != b',' {
-            end += 1;
-        }
-
-        // Trim trailing whitespace from this entry
-        let mut entry_end = end;
-        while entry_end > start && (if_none_match[entry_end - 1] == b' ' || if_none_match[entry_end - 1] == b'\t') {
-            entry_end -= 1;
-        }
-
-        let client_tag = strip_etag_decoration(&if_none_match[start..entry_end]);
-        if client_tag == server_tag {
-            return true;
-        }
-
-        start = end + 1;
-    }
-    false
+    if_none_match
+        .split(|&b| b == b',')
+        .any(|entry| strip_etag_decoration(entry.trim_ascii()) == server_tag)
 }
 
 fn strip_etag_decoration(etag: &[u8]) -> &[u8] {
-    let mut s = etag;
-    // Strip W/ prefix
-    if s.len() >= 2 && s[0] == b'W' && s[1] == b'/' {
-        s = &s[2..];
-    }
-    // Strip surrounding quotes
-    if s.len() >= 2 && s[0] == b'"' && s[s.len() - 1] == b'"' {
-        s = &s[1..s.len() - 1];
-    }
-    s
+    let s = etag.strip_prefix(b"W/").unwrap_or(etag);
+    s.strip_prefix(b"\"")
+        .and_then(|inner| inner.strip_suffix(b"\""))
+        .unwrap_or(s)
 }
 
-// Fast zero-allocation HTTP request line parser
-fn parse_request_line_fast(request: &[u8]) -> Option<(&[u8], &str, &str)> {
-    let mut parts = request.split(|&b| b == b' ').filter(|part| !part.is_empty());
-    
+// Zero-allocation request line parser: "METHOD path HTTP/x.y"
+fn parse_request_line(line: &[u8]) -> Option<(&[u8], &str, &[u8])> {
+    let mut parts = line.split(|&b| b == b' ').filter(|part| !part.is_empty());
+
     let method = parts.next()?;
     let path_bytes = parts.next()?;
-    let version_bytes = parts.next()?;
-    
-    // Ensure there are no extra parts after the three required ones
+    let version = parts.next()?;
     if parts.next().is_some() {
         return None;
     }
-    
-    // Convert path and version to &str for compatibility with existing code
+
     let path = std::str::from_utf8(path_bytes).ok()?;
-    let version = std::str::from_utf8(version_bytes).ok()?;
-    
+
+    // Absolute-form URI (RFC 7230 §5.3.2): "http://host/path" → "/path"
+    let path = match path
+        .strip_prefix("http://")
+        .or_else(|| path.strip_prefix("https://"))
+    {
+        Some(rest) => match rest.find('/') {
+            Some(i) => &rest[i..],
+            None => "/",
+        },
+        None => path,
+    };
+
     Some((method, path, version))
+}
+
+/// A parsed request borrowing directly from the connection buffer — no copies
+struct ParsedRequest<'a> {
+    consumed: usize,
+    is_head: bool,
+    keep_alive: bool,
+    path: &'a str,
+    if_modified_since: Option<&'a [u8]>,
+    if_none_match: Option<&'a [u8]>,
+}
+
+enum RequestError {
+    Malformed,
+    MethodNotAllowed,
+}
+
+/// Find \r\n\r\n, returning the index of its first byte
+#[inline]
+fn find_header_end(buf: &[u8]) -> Option<usize> {
+    buf.windows(4).position(|window| window == b"\r\n\r\n")
+}
+
+/// Parse one request whose headers end at `header_end` (as found by find_header_end)
+fn parse_request(buf: &[u8], header_end: usize) -> Result<ParsedRequest<'_>, RequestError> {
+    let consumed = header_end + 4;
+
+    // A '\n' always exists at header_end + 1, so the fallback is unreachable
+    let req_line_end = buf
+        .iter()
+        .position(|&b| b == b'\n')
+        .unwrap_or(header_end + 1);
+    let request_line = buf[..req_line_end].trim_ascii();
+    if request_line.is_empty() {
+        return Err(RequestError::Malformed);
+    }
+
+    let (method, path, version) =
+        parse_request_line(request_line).ok_or(RequestError::Malformed)?;
+    if method != b"GET" && method != b"HEAD" {
+        return Err(RequestError::MethodNotAllowed);
+    }
+
+    let is_http11 = version == b"HTTP/1.1";
+    let mut keep_alive = is_http11;
+    let mut if_modified_since = None;
+    let mut if_none_match = None;
+
+    let mut pos = req_line_end + 1;
+    while pos < header_end {
+        let line_end = buf[pos..header_end]
+            .iter()
+            .position(|&b| b == b'\n')
+            .map_or(header_end, |offset| pos + offset);
+        let line = buf[pos..line_end].trim_ascii();
+        pos = line_end + 1;
+
+        if line.is_empty() {
+            continue;
+        }
+
+        if header_starts_with(line, b"connection:") {
+            keep_alive = !header_contains(line, b"close")
+                && (is_http11 || header_contains(line, b"keep-alive"));
+        } else if header_starts_with(line, b"if-modified-since:") {
+            if_modified_since = extract_header_value(line, b"if-modified-since:");
+        } else if header_starts_with(line, b"if-none-match:") {
+            if_none_match = extract_header_value(line, b"if-none-match:");
+        }
+    }
+
+    Ok(ParsedRequest {
+        consumed,
+        is_head: method == b"HEAD",
+        keep_alive,
+        path,
+        if_modified_since,
+        if_none_match,
+    })
 }
 
 fn build_file_cache(static_dir: &str) -> FileCache {
     let mut cache = FileCache::new();
-    
+
     if let Err(e) = discover_files_recursive(static_dir, "", &mut cache) {
         eprintln!("Warning: Failed to build file cache: {}", e);
     }
-    
-    let entry_count = cache.entry_count();
-    println!("File cache built with {} entries", entry_count);
+
+    println!("File cache built with {} entries", cache.entry_count());
     cache
 }
 
@@ -345,17 +328,14 @@ fn discover_files_recursive(
     relative_path: &str,
     cache: &mut FileCache,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Optimized path construction using pre-allocated capacity
     let mut full_path = String::with_capacity(base_dir.len() + relative_path.len() + 1);
     full_path.push_str(base_dir);
     if !relative_path.is_empty() {
         full_path.push('/');
         full_path.push_str(relative_path);
     }
-    
-    let entries = read_dir(&full_path)?;
-    
-    for entry in entries {
+
+    for entry in read_dir(&full_path)? {
         let entry = entry?;
         let file_type = entry.file_type()?;
 
@@ -378,143 +358,141 @@ fn discover_files_recursive(
         };
 
         if file_type.is_file() {
-            // Generate cache entry for this file
-            if let Ok(cache_entry) = generate_cache_entry(&entry.path()) {
-                // Optimized URL path construction
-                let mut url_path = String::with_capacity(current_relative.len() + 1);
-                url_path.push('/');
-                url_path.push_str(&current_relative);
-                
-                // Cache entry - automatically handles trailing slashes and index.html mapping
-                cache.insert(&url_path, cache_entry);
+            match generate_cache_entry(&entry.path()) {
+                Ok(cache_entry) => {
+                    let mut url_path = String::with_capacity(current_relative.len() + 1);
+                    url_path.push('/');
+                    url_path.push_str(&current_relative);
+                    cache.insert(&url_path, cache_entry);
+                }
+                Err(e) => eprintln!("Warning: skipping {}: {}", entry.path().display(), e),
             }
         } else if file_type.is_dir() {
-            // Recursively process directories
             discover_files_recursive(base_dir, &current_relative, cache)?;
         }
     }
-    
+
     Ok(())
 }
 
-fn generate_cache_entry(file_path: &std::path::Path) -> Result<CacheEntry, Box<dyn std::error::Error>> {
+fn generate_cache_entry(
+    file_path: &std::path::Path,
+) -> Result<CacheEntry, Box<dyn std::error::Error>> {
     let file_metadata = metadata(file_path)?;
-    let size = file_metadata.len();
-    let last_modified_raw = file_metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-    // Truncate to second precision during cache building for HTTP compliance
-    let last_modified = {
-        let duration_since_epoch = last_modified_raw.duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap_or_else(|_| Duration::from_secs(0));
-        let seconds_only = Duration::from_secs(duration_since_epoch.as_secs());
-        SystemTime::UNIX_EPOCH + seconds_only
-    };
-    
-    // Generate weak ETag using size and modification time
-    let mtime_secs = last_modified
+    if file_metadata.len() > MAX_FILE_SIZE {
+        return Err(format!(
+            "file exceeds the {} MB cache limit",
+            MAX_FILE_SIZE / (1024 * 1024)
+        )
+        .into());
+    }
+
+    // Truncate mtime to whole seconds to match HTTP date resolution
+    let mtime_secs = file_metadata
+        .modified()
+        .unwrap_or(SystemTime::UNIX_EPOCH)
         .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or(Duration::from_secs(0))
+        .unwrap_or(Duration::ZERO)
         .as_secs();
-    let etag = format!("W/\"{}-{}\"", size, mtime_secs);
-    
-    // Get MIME type using fast enum lookup during cache building
-    let mime_type_enum = get_mime_type_enum(file_path);
-    let mime_type_str = mime_type_enum.as_str();
-    
-    // Format HTTP date once during cache building - RFC 7231 compliant
+    let last_modified = SystemTime::UNIX_EPOCH + Duration::from_secs(mtime_secs);
     let last_modified_str = httpdate::fmt_http_date(last_modified);
-    
-    // ZERO-I/O OPTIMIZATION: Pre-load file content into memory
+
     let content = read(file_path)?;
-    let actual_size = content.len();
-    
-    // Pre-generate complete HTTP headers
+    let etag = format!("W/\"{}-{}\"", content.len(), mtime_secs);
+
+    // Pre-combine headers + content so the hot path is a single write()
     let headers = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\nLast-Modified: {}\r\nETag: {}\r\nCache-Control: public, max-age=3600\r\nX-Content-Type-Options: nosniff\r\nConnection: keep-alive\r\n\r\n",
-        mime_type_str, actual_size, last_modified_str, etag
-    ).into_bytes();
-    
-    // Store header length for HEAD request slicing
+        mime_type(file_path),
+        content.len(),
+        last_modified_str,
+        etag
+    );
     let header_length = headers.len();
-    
-    // Pre-combine headers + content for single write()
-    let mut complete_response = Vec::with_capacity(headers.len() + content.len());
-    complete_response.extend_from_slice(&headers);
+    let mut complete_response = headers.into_bytes();
+    complete_response.reserve_exact(content.len());
     complete_response.extend_from_slice(&content);
-    
-    // Pre-generate custom 304 Not Modified response with file-specific ETag
+
     let not_modified_response = format!(
         "HTTP/1.1 304 Not Modified\r\nETag: {}\r\nCache-Control: public, max-age=3600\r\nConnection: keep-alive\r\n\r\n",
         etag
-    ).into_bytes();
-    
+    );
+
     Ok(CacheEntry {
-        complete_response: Arc::from(complete_response.into_boxed_slice()),
+        complete_response: complete_response.into(),
         header_length,
-        not_modified_response: Arc::from(not_modified_response.into_boxed_slice()),
-        etag: Arc::from(etag.into_boxed_str()),
+        not_modified_response: not_modified_response.into_bytes().into(),
+        etag: etag.into(),
+        last_modified_str: last_modified_str.into(),
         last_modified_timestamp: last_modified,
     })
 }
 
-
 #[tokio::main]
 async fn main() {
-    // Parse command line arguments - pay overhead only once here
+    // Parse CLI arguments and environment once - zero runtime overhead thereafter
     let config = Config::parse();
-    
-    // Extract values once at startup - zero runtime overhead thereafter
-    let port = config.port;
-    let max_request_size = config.max_request_size;
-    let static_dir = config.static_dir;
-    let keepalive_timeout_secs = config.keepalive_timeout_secs;
-    let bind_ip = config.bind_ip;
-    
-    // Initialize header templates and file cache at startup - not on first request
-    HEADER_TEMPLATES.set(HeaderTemplates::new())
-        .expect("Failed to initialize header templates");
-    
-    let cache = build_file_cache(&static_dir);
-    FILE_CACHE.set(cache)
-        .expect("Failed to initialize file cache");
 
-    // Run server with direct config values - true zero overhead
-    run_server(bind_ip, port, max_request_size, keepalive_timeout_secs).await;
+    // Initialize header templates and file cache before accepting traffic
+    assert!(
+        HEADER_TEMPLATES.set(HeaderTemplates::new()).is_ok(),
+        "header templates already initialized"
+    );
+    assert!(
+        FILE_CACHE.set(build_file_cache(&config.static_dir)).is_ok(),
+        "file cache already initialized"
+    );
+
+    run_server(
+        &config.bind_ip,
+        config.port,
+        config.max_request_size,
+        Duration::from_secs(config.keepalive_timeout_secs),
+    )
+    .await;
 }
 
-async fn run_server(
-    bind_ip: String,
-    port: u16,
-    max_request_size: usize,
-    keepalive_timeout_secs: u64,
-) {
-    let listener = TcpListener::bind(format!("{}:{}", bind_ip, port))
+async fn run_server(bind_ip: &str, port: u16, max_request_size: usize, keepalive: Duration) {
+    let listener = TcpListener::bind(format!("{bind_ip}:{port}"))
         .await
         .expect("Failed to bind to address");
 
-    println!("Async KISS server running on http://{}:{}", bind_ip, port);
+    println!("Async KISS server running on http://{bind_ip}:{port}");
+
+    // Install signal handlers once, outside the accept loop
+    let shutdown = shutdown_signal();
+    tokio::pin!(shutdown);
 
     loop {
         tokio::select! {
             result = listener.accept() => {
                 match result {
                     Ok((stream, _)) => {
-                        // Configure TCP socket for performance
                         let _ = stream.set_nodelay(true);
-                        tokio::spawn(handle_connection(
-                            stream,
-                            max_request_size,
-                            keepalive_timeout_secs,
-                        ));
+                        ACTIVE_CONNECTIONS.fetch_add(1, Ordering::Relaxed);
+                        tokio::spawn(async move {
+                            let _guard = ConnGuard;
+                            handle_connection(stream, max_request_size, keepalive).await;
+                        });
                     }
-                    Err(_) => continue,
+                    // Transient accept failure (e.g. fd exhaustion): back off instead of spinning
+                    Err(_) => sleep(Duration::from_millis(10)).await,
                 }
             }
-            _ = shutdown_signal() => {
+            _ = &mut shutdown => {
                 println!("Shutdown signal received, stopping server...");
                 SHUTDOWN.store(true, Ordering::Relaxed);
                 break;
             }
         }
+    }
+
+    // Stop accepting, then drain: idle connections notice the shutdown flag
+    // within one keepalive window, in-flight responses get a grace period.
+    drop(listener);
+    let deadline = Instant::now() + keepalive + Duration::from_secs(2);
+    while ACTIVE_CONNECTIONS.load(Ordering::Acquire) > 0 && Instant::now() < deadline {
+        sleep(Duration::from_millis(25)).await;
     }
 
     println!("Server shutdown complete");
@@ -544,322 +522,162 @@ async fn shutdown_signal() {
     }
 }
 
-/// Parsed request as byte offsets into the source buffer — no borrows, no allocations
-struct ParsedRequest {
-    consumed: usize,
-    is_head: bool,
-    keep_alive: bool,
-    path_start: usize,
-    path_end: usize,
-    if_modified_since: Option<(usize, usize)>,
-    if_none_match: Option<(usize, usize)>,
-}
-
-/// Synchronously parse a complete HTTP request from a buffer using byte offsets.
-fn parse_request_from_buf(buf: &[u8], max_request_size: usize) -> Result<ParsedRequest, RequestError> {
-    if buf.len() > max_request_size {
-        return Err(RequestError::TooLarge);
+/// Send a fatal error response, then FIN and briefly drain unread request
+/// bytes so the client can read the response before the socket closes
+/// (closing with a non-empty receive queue would send a RST that destroys it).
+async fn send_final_response(stream: &mut TcpStream, response: &[u8]) {
+    if stream.write_all(response).await.is_err() {
+        return;
     }
+    let _ = stream.shutdown().await;
 
-    let header_end = find_header_end(buf).ok_or(RequestError::Incomplete)?;
-    let consumed = header_end + 4;
-
-    let req_line_end = memchr_byte(b'\n', buf).ok_or(RequestError::Malformed)?;
-    let request_line = trim_header_line(&buf[..req_line_end]);
-    if request_line.is_empty() {
-        return Err(RequestError::Malformed);
-    }
-
-    let (method, path, version) = parse_request_line_fast(request_line)
-        .ok_or(RequestError::Malformed)?;
-
-    if method != b"GET" && method != b"HEAD" {
-        return Err(RequestError::MethodNotAllowed);
-    }
-
-    // Compute path byte offsets relative to buf
-    let path_bytes = path.as_bytes();
-    let path_start = path_bytes.as_ptr() as usize - buf.as_ptr() as usize;
-    let path_end = path_start + path_bytes.len();
-
-    let mut keep_alive = version == "HTTP/1.1";
-    let mut if_modified_since: Option<(usize, usize)> = None;
-    let mut if_none_match: Option<(usize, usize)> = None;
-
-    let mut pos = req_line_end + 1;
-    while pos < header_end {
-        let line_end = match memchr_byte(b'\n', &buf[pos..header_end]) {
-            Some(offset) => pos + offset,
-            None => header_end,
-        };
-
-        let line = trim_header_line(&buf[pos..line_end]);
-        pos = line_end + 1;
-
-        if line.is_empty() {
-            continue;
-        }
-
-        if header_starts_with(line, b"connection:") {
-            let connection_close_requested = header_contains(line, b"close");
-            keep_alive = !connection_close_requested && (version == "HTTP/1.1" || header_contains(line, b"keep-alive"));
-        } else if header_starts_with(line, b"if-modified-since:") {
-            if let Some(value) = extract_header_value(line, b"if-modified-since:") {
-                let start = value.as_ptr() as usize - buf.as_ptr() as usize;
-                if_modified_since = Some((start, start + value.len()));
-            }
-        } else if header_starts_with(line, b"if-none-match:") {
-            if let Some(value) = extract_header_value(line, b"if-none-match:") {
-                let start = value.as_ptr() as usize - buf.as_ptr() as usize;
-                if_none_match = Some((start, start + value.len()));
-            }
+    let mut discard = [0u8; 4096];
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let wait = deadline.saturating_duration_since(Instant::now());
+        match timeout(wait, stream.read(&mut discard)).await {
+            Ok(Ok(n)) if n > 0 => continue,
+            // EOF, error, or drain deadline reached
+            _ => break,
         }
     }
-
-    Ok(ParsedRequest {
-        consumed,
-        is_head: method == b"HEAD",
-        keep_alive,
-        path_start,
-        path_end,
-        if_modified_since,
-        if_none_match,
-    })
 }
 
-enum RequestError {
-    Incomplete,
-    TooLarge,
-    Malformed,
-    MethodNotAllowed,
-}
-
-/// Find \r\n\r\n in buffer, return index of first \r
-#[inline]
-fn find_header_end(buf: &[u8]) -> Option<usize> {
-    if buf.len() < 4 {
-        return None;
-    }
-    let mut i = 0;
-    let end = buf.len() - 3;
-    while i < end {
-        if buf[i] == b'\r' && buf[i + 1] == b'\n' && buf[i + 2] == b'\r' && buf[i + 3] == b'\n' {
-            return Some(i);
-        }
-        i += 1;
-    }
-    None
-}
-
-#[inline]
-fn memchr_byte(needle: u8, haystack: &[u8]) -> Option<usize> {
-    haystack.iter().position(|&b| b == needle)
-}
-
-/// Extract request fields from buffer using offsets, returning owned data for dispatch.
-/// Per-connection buffers are reused via clear() to avoid allocation.
-fn extract_request_fields(
-    buf: &[u8],
-    parsed: &ParsedRequest,
-    path_buf: &mut String,
-    ims_buf: &mut Vec<u8>,
-    inm_buf: &mut Vec<u8>,
-) {
-    path_buf.clear();
-    ims_buf.clear();
-    inm_buf.clear();
-
-    // Safety: parse_request_line_fast already validated path as UTF-8
-    let path_bytes = &buf[parsed.path_start..parsed.path_end];
-    path_buf.push_str(unsafe { std::str::from_utf8_unchecked(path_bytes) });
-
-    if let Some((start, end)) = parsed.if_modified_since {
-        ims_buf.extend_from_slice(&buf[start..end]);
-    }
-    if let Some((start, end)) = parsed.if_none_match {
-        inm_buf.extend_from_slice(&buf[start..end]);
-    }
-}
-
-async fn handle_connection(
-    stream: TcpStream,
-    max_request_size: usize,
-    keepalive_timeout_secs: u64,
-) {
+async fn handle_connection(mut stream: TcpStream, max_request_size: usize, keepalive: Duration) {
     let templates = HEADER_TEMPLATES.get().unwrap();
-    let mut stream = BufReader::new(stream);
+    let file_cache = FILE_CACHE.get().unwrap();
 
-    // Per-connection reusable buffers for extracted request data
-    let mut path_buf = String::with_capacity(256);
-    let mut ims_buf = Vec::with_capacity(64);
-    let mut inm_buf = Vec::with_capacity(128);
+    // Single per-connection buffer, reused across requests. Pipelined bytes
+    // beyond the current request stay in the buffer for the next iteration.
+    let mut buf: Vec<u8> = Vec::with_capacity(max_request_size.min(8192));
 
     loop {
-        if SHUTDOWN.load(Ordering::Relaxed) {
-            break;
-        }
+        // Read until buf holds a complete header block. The keepalive window
+        // bounds the idle wait for a first byte; once bytes arrive, the full
+        // headers must land within one more window (anti-slowloris deadline).
+        let mut deadline: Option<Instant> = None;
+        let header_end = loop {
+            if let Some(i) = find_header_end(&buf) {
+                if i + 4 > max_request_size {
+                    send_final_response(&mut stream, &templates.request_too_large).await;
+                    return;
+                }
+                break i;
+            }
+            if buf.len() >= max_request_size {
+                send_final_response(&mut stream, &templates.request_too_large).await;
+                return;
+            }
 
-        // Single async read to fill the internal buffer
-        let parse_result = match timeout(
-            Duration::from_secs(keepalive_timeout_secs),
-            stream.fill_buf(),
-        )
-        .await
-        {
-            Ok(Ok(buf)) if !buf.is_empty() => parse_request_from_buf(buf, max_request_size),
-            _ => break,
+            if SHUTDOWN.load(Ordering::Relaxed) {
+                return;
+            }
+
+            // Fast path (empty buf, whole request in one read) never touches the
+            // clock; the deadline is armed only once a partial request is buffered.
+            let wait = if buf.is_empty() {
+                keepalive
+            } else {
+                deadline
+                    .get_or_insert_with(|| Instant::now() + keepalive)
+                    .saturating_duration_since(Instant::now())
+            };
+            match timeout(wait, stream.read_buf(&mut buf)).await {
+                Ok(Ok(n)) if n > 0 => {}
+                // Peer closed, IO error, or timed out
+                _ => return,
+            }
         };
 
-        match parse_result {
-            Ok(parsed) => {
-                // Re-borrow buffer to extract fields before consuming
-                {
-                    let buf = stream.buffer();
-                    extract_request_fields(buf, &parsed, &mut path_buf, &mut ims_buf, &mut inm_buf);
-                }
-                stream.consume(parsed.consumed);
-
-                let ims = if ims_buf.is_empty() { None } else { Some(ims_buf.as_slice()) };
-                let inm = if inm_buf.is_empty() { None } else { Some(inm_buf.as_slice()) };
-
-                if handle_request(&mut stream, &path_buf, parsed.is_head, ims, inm).await {
-                    if !parsed.keep_alive {
-                        break;
-                    }
-                } else {
-                    break;
-                }
-            }
-            Err(RequestError::Incomplete) => {
-                // Headers span multiple TCP segments — accumulate into owned buffer
-                let mut accumulated = Vec::with_capacity(max_request_size);
-                accumulated.extend_from_slice(stream.buffer());
-                let buf_len = accumulated.len();
-                stream.consume(buf_len);
-
-                loop {
-                    let more = match stream.fill_buf().await {
-                        Ok(b) if !b.is_empty() => b,
-                        _ => break,
-                    };
-                    accumulated.extend_from_slice(more);
-                    let more_len = more.len();
-                    stream.consume(more_len);
-
-                    if accumulated.len() > max_request_size {
-                        let _ = stream.write_all(&templates.request_too_large).await;
-                        return;
-                    }
-
-                    if find_header_end(&accumulated).is_some() {
-                        break;
-                    }
-                }
-
-                match parse_request_from_buf(&accumulated, max_request_size) {
-                    Ok(parsed) => {
-                        extract_request_fields(&accumulated, &parsed, &mut path_buf, &mut ims_buf, &mut inm_buf);
-
-                        let ims = if ims_buf.is_empty() { None } else { Some(ims_buf.as_slice()) };
-                        let inm = if inm_buf.is_empty() { None } else { Some(inm_buf.as_slice()) };
-
-                        if handle_request(&mut stream, &path_buf, parsed.is_head, ims, inm).await {
-                            if !parsed.keep_alive {
-                                break;
-                            }
-                        } else {
-                            break;
-                        }
-                    }
-                    Err(RequestError::TooLarge) => {
-                        let _ = stream.write_all(&templates.request_too_large).await;
-                        break;
-                    }
-                    Err(RequestError::MethodNotAllowed) => {
-                        let _ = stream.write_all(&templates.method_not_allowed).await;
-                        break;
-                    }
-                    Err(_) => {
-                        let _ = stream.write_all(&templates.bad_request).await;
-                        break;
-                    }
-                }
-            }
-            Err(RequestError::TooLarge) => {
-                let _ = stream.write_all(&templates.request_too_large).await;
-                break;
-            }
+        let parsed = match parse_request(&buf, header_end) {
+            Ok(parsed) => parsed,
             Err(RequestError::MethodNotAllowed) => {
-                let _ = stream.write_all(&templates.method_not_allowed).await;
-                break;
+                send_final_response(&mut stream, &templates.method_not_allowed).await;
+                return;
             }
             Err(RequestError::Malformed) => {
-                let _ = stream.write_all(&templates.bad_request).await;
-                break;
+                send_final_response(&mut stream, &templates.bad_request).await;
+                return;
             }
+        };
+
+        let consumed = parsed.consumed;
+        let keep_alive = parsed.keep_alive;
+        let ok = handle_request(&mut stream, templates, file_cache, &parsed).await;
+        if consumed == buf.len() {
+            buf.clear();
+        } else {
+            // Keep pipelined bytes belonging to the next request
+            buf.drain(..consumed);
+        }
+
+        if !ok || !keep_alive {
+            return;
         }
     }
 }
-
 
 async fn handle_request(
-    writer: &mut BufReader<TcpStream>,
-    path: &str,
-    is_head: bool,
-    if_modified_since: Option<&[u8]>,
-    if_none_match: Option<&[u8]>,
+    stream: &mut TcpStream,
+    templates: &HeaderTemplates,
+    file_cache: &FileCache,
+    req: &ParsedRequest<'_>,
 ) -> bool {
-    let templates = HEADER_TEMPLATES.get().unwrap();
-
-    if path == "/health" {
-        let result = if is_head {
-            writer.write_all(&templates.health_headers_only).await
+    if req.path == "/health" {
+        let end = if req.is_head {
+            templates.health_header_length
         } else {
-            writer.write_all(&templates.health_complete).await
+            templates.health.len()
         };
-        return result.is_ok();
+        return stream.write_all(&templates.health[..end]).await.is_ok();
     }
 
-    if path == "/ready" {
-        let result = if is_head {
-            writer.write_all(&templates.ready_headers_only).await
+    if req.path == "/ready" {
+        let end = if req.is_head {
+            templates.ready_header_length
         } else {
-            writer.write_all(&templates.ready_complete).await
+            templates.ready.len()
         };
-        return result.is_ok();
+        return stream.write_all(&templates.ready[..end]).await.is_ok();
     }
 
-    let file_cache = FILE_CACHE.get().unwrap();
-    let cache_entry = file_cache.get(path);
-
-    if let Some(cache_entry) = cache_entry {
-        if let Some(if_modified_since_bytes) = if_modified_since {
-            if let Ok(if_modified_since_str) = std::str::from_utf8(if_modified_since_bytes) {
-                if let Ok(client_time) = httpdate::parse_http_date(if_modified_since_str) {
-                    if cache_entry.last_modified_timestamp <= client_time {
-                        let result = writer.write_all(&cache_entry.not_modified_response).await;
-                        return result.is_ok();
-                    }
-                }
-            }
-        }
-
-        if let Some(client_etag_bytes) = if_none_match {
-            if etag_matches(client_etag_bytes, cache_entry.etag.as_bytes()) {
-                let result = writer.write_all(&cache_entry.not_modified_response).await;
-                return result.is_ok();
-            }
-        }
-
-        let result = if is_head {
-            writer.write_all(&cache_entry.complete_response[..cache_entry.header_length]).await
+    let Some(entry) = file_cache.get(req.path) else {
+        let end = if req.is_head {
+            templates.not_found_header_length
         } else {
-            writer.write_all(&cache_entry.complete_response).await
+            templates.not_found.len()
         };
-        result.is_ok()
+        return stream.write_all(&templates.not_found[..end]).await.is_ok();
+    };
+
+    // RFC 7232 §6: If-None-Match takes precedence; If-Modified-Since applies
+    // only when no ETag was sent.
+    let not_modified = match (req.if_none_match, req.if_modified_since) {
+        (Some(inm), _) => etag_matches(inm, entry.etag.as_bytes()),
+        (None, Some(ims)) => {
+            // Fast path: clients usually echo our Last-Modified value byte-for-byte
+            ims == entry.last_modified_str.as_bytes()
+                || std::str::from_utf8(ims)
+                    .ok()
+                    .and_then(|s| httpdate::parse_http_date(s).ok())
+                    .is_some_and(|t| entry.last_modified_timestamp <= t)
+        }
+        (None, None) => false,
+    };
+    if not_modified {
+        return stream
+            .write_all(&entry.not_modified_response)
+            .await
+            .is_ok();
+    }
+
+    let end = if req.is_head {
+        entry.header_length
     } else {
-        let result = writer.write_all(&templates.not_found).await;
-        result.is_ok()
-    }
+        entry.complete_response.len()
+    };
+    stream
+        .write_all(&entry.complete_response[..end])
+        .await
+        .is_ok()
 }
-

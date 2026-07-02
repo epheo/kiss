@@ -1,4 +1,4 @@
-use kiss::get_mime_type_enum;
+use kiss::mime_type;
 use std::path::Path;
 
 
@@ -8,70 +8,70 @@ mod mime_type_tests {
     
     #[test]
     fn test_html_mime_types() {
-        assert_eq!(get_mime_type_enum(Path::new("index.html")).as_str(), "text/html; charset=utf-8");
-        assert_eq!(get_mime_type_enum(Path::new("page.htm")).as_str(), "text/html; charset=utf-8");
-        assert_eq!(get_mime_type_enum(Path::new("INDEX.HTML")).as_str(), "text/html; charset=utf-8"); // case insensitive
+        assert_eq!(mime_type(Path::new("index.html")), "text/html; charset=utf-8");
+        assert_eq!(mime_type(Path::new("page.htm")), "text/html; charset=utf-8");
+        assert_eq!(mime_type(Path::new("INDEX.HTML")), "text/html; charset=utf-8"); // case insensitive
     }
     
     #[test]
     fn test_css_mime_type() {
-        assert_eq!(get_mime_type_enum(Path::new("style.css")).as_str(), "text/css; charset=utf-8");
-        assert_eq!(get_mime_type_enum(Path::new("STYLE.CSS")).as_str(), "text/css; charset=utf-8");
+        assert_eq!(mime_type(Path::new("style.css")), "text/css; charset=utf-8");
+        assert_eq!(mime_type(Path::new("STYLE.CSS")), "text/css; charset=utf-8");
     }
     
     #[test]
     fn test_javascript_mime_type() {
-        assert_eq!(get_mime_type_enum(Path::new("app.js")).as_str(), "text/javascript; charset=utf-8");
-        assert_eq!(get_mime_type_enum(Path::new("script.JS")).as_str(), "text/javascript; charset=utf-8");
+        assert_eq!(mime_type(Path::new("app.js")), "text/javascript; charset=utf-8");
+        assert_eq!(mime_type(Path::new("script.JS")), "text/javascript; charset=utf-8");
     }
     
     #[test]
     fn test_json_mime_type() {
-        assert_eq!(get_mime_type_enum(Path::new("data.json")).as_str(), "application/json; charset=utf-8");
+        assert_eq!(mime_type(Path::new("data.json")), "application/json; charset=utf-8");
     }
     
     #[test]
     fn test_image_mime_types() {
-        assert_eq!(get_mime_type_enum(Path::new("image.png")).as_str(), "image/png");
-        assert_eq!(get_mime_type_enum(Path::new("photo.jpg")).as_str(), "image/jpeg");
-        assert_eq!(get_mime_type_enum(Path::new("photo.jpeg")).as_str(), "image/jpeg");
-        assert_eq!(get_mime_type_enum(Path::new("icon.gif")).as_str(), "image/gif");
-        assert_eq!(get_mime_type_enum(Path::new("logo.svg")).as_str(), "image/svg+xml");
-        assert_eq!(get_mime_type_enum(Path::new("favicon.ico")).as_str(), "image/x-icon");
+        assert_eq!(mime_type(Path::new("image.png")), "image/png");
+        assert_eq!(mime_type(Path::new("photo.jpg")), "image/jpeg");
+        assert_eq!(mime_type(Path::new("photo.jpeg")), "image/jpeg");
+        assert_eq!(mime_type(Path::new("icon.gif")), "image/gif");
+        assert_eq!(mime_type(Path::new("logo.svg")), "image/svg+xml");
+        assert_eq!(mime_type(Path::new("favicon.ico")), "image/x-icon");
     }
     
     #[test]
     fn test_font_mime_types() {
-        assert_eq!(get_mime_type_enum(Path::new("font.woff")).as_str(), "font/woff");
-        assert_eq!(get_mime_type_enum(Path::new("font.woff2")).as_str(), "font/woff2");
-        assert_eq!(get_mime_type_enum(Path::new("font.ttf")).as_str(), "font/ttf");
-        assert_eq!(get_mime_type_enum(Path::new("font.eot")).as_str(), "application/vnd.ms-fontobject");
+        assert_eq!(mime_type(Path::new("font.woff")), "font/woff");
+        assert_eq!(mime_type(Path::new("font.woff2")), "font/woff2");
+        assert_eq!(mime_type(Path::new("font.ttf")), "font/ttf");
+        assert_eq!(mime_type(Path::new("font.eot")), "application/vnd.ms-fontobject");
     }
     
     #[test]
     fn test_other_mime_types() {
-        assert_eq!(get_mime_type_enum(Path::new("document.pdf")).as_str(), "application/pdf");
-        assert_eq!(get_mime_type_enum(Path::new("data.xml")).as_str(), "application/xml; charset=utf-8");
-        assert_eq!(get_mime_type_enum(Path::new("readme.txt")).as_str(), "text/plain; charset=utf-8");
+        assert_eq!(mime_type(Path::new("document.pdf")), "application/pdf");
+        assert_eq!(mime_type(Path::new("data.xml")), "application/xml; charset=utf-8");
+        assert_eq!(mime_type(Path::new("readme.txt")), "text/plain; charset=utf-8");
     }
     
     #[test]
     fn test_no_extension() {
-        assert_eq!(get_mime_type_enum(Path::new("file")).as_str(), "application/octet-stream");
-        assert_eq!(get_mime_type_enum(Path::new("Dockerfile")).as_str(), "application/octet-stream");
+        assert_eq!(mime_type(Path::new("file")), "application/octet-stream");
+        assert_eq!(mime_type(Path::new("Dockerfile")), "application/octet-stream");
     }
     
     #[test]
     fn test_unknown_extension() {
-        assert_eq!(get_mime_type_enum(Path::new("file.unknown")).as_str(), "application/octet-stream");
-        assert_eq!(get_mime_type_enum(Path::new("data.xyz")).as_str(), "application/octet-stream");
+        assert_eq!(mime_type(Path::new("file.unknown")), "application/octet-stream");
+        assert_eq!(mime_type(Path::new("data.xyz")), "application/octet-stream");
     }
     
     #[test]
     fn test_path_with_directories() {
-        assert_eq!(get_mime_type_enum(Path::new("/css/main.css")).as_str(), "text/css; charset=utf-8");
-        assert_eq!(get_mime_type_enum(Path::new("/images/logo.png")).as_str(), "image/png");
-        assert_eq!(get_mime_type_enum(Path::new("/js/modules/app.js")).as_str(), "text/javascript; charset=utf-8");
+        assert_eq!(mime_type(Path::new("/css/main.css")), "text/css; charset=utf-8");
+        assert_eq!(mime_type(Path::new("/images/logo.png")), "image/png");
+        assert_eq!(mime_type(Path::new("/js/modules/app.js")), "text/javascript; charset=utf-8");
     }
 }
 
