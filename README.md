@@ -89,6 +89,13 @@ curl http://localhost:8080/health   # Liveness probe
 curl http://localhost:8080/ready    # Readiness probe
 ```
 
+## Custom 404 Page
+
+A `404.html` at the root of the content directory becomes the 404 response body,
+served as `text/html`. Like everything else it is read once at startup and
+pre-generated, so misses stay a single `write()`. Without it, KISS answers with
+a plain text `File not found`.
+
 ## Security
 
 - **Scratch base image** — no shell, no OS packages, minimal attack surface

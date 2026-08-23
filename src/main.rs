@@ -127,7 +127,7 @@ struct HeaderTemplates {
 }
 
 impl HeaderTemplates {
-    fn new() -> Self {
+    fn new(not_found_body: Option<Vec<u8>>) -> Self {
         let (health, health_header_length) = Self::keep_alive_response(
             "200 OK",
             "application/json",
@@ -138,8 +138,10 @@ impl HeaderTemplates {
             "application/json",
             br#"{"status":"ready","timestamp":"0"}"#,
         );
-        let (not_found, not_found_header_length) =
-            Self::keep_alive_response("404 Not Found", "text/plain", b"File not found");
+        let (not_found, not_found_header_length) = match not_found_body {
+            Some(body) => Self::keep_alive_response("404 Not Found", "text/html", &body),
+            None => Self::keep_alive_response("404 Not Found", "text/plain", b"File not found"),
+        };
 
         Self {
             not_found,
@@ -433,9 +435,12 @@ async fn main() {
     // Parse CLI arguments and environment once - zero runtime overhead thereafter
     let config = Config::parse();
 
-    // Initialize header templates and file cache before accepting traffic
+    // Initialize header templates and file cache before accepting traffic.
+    // A 404.html in the content dir becomes the pre-generated 404 body,
+    // read once here so runtime stays free of filesystem operations.
+    let not_found_body = read(format!("{}/404.html", config.static_dir)).ok();
     assert!(
-        HEADER_TEMPLATES.set(HeaderTemplates::new()).is_ok(),
+        HEADER_TEMPLATES.set(HeaderTemplates::new(not_found_body)).is_ok(),
         "header templates already initialized"
     );
     assert!(
