@@ -89,6 +89,12 @@ curl http://localhost:8080/health   # Liveness probe
 curl http://localhost:8080/ready    # Readiness probe
 ```
 
+## Range Requests
+
+Single `bytes=` ranges get a 206 with `Content-Range`, so browsers can seek
+and Safari will play `<video>` and `<audio>` files. Multi-range requests are
+answered with the full file. Every 200 carries `Accept-Ranges: bytes`.
+
 ## Custom 404 Page
 
 A `404.html` at the root of the content directory becomes the 404 response body,

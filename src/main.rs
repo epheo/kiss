@@ -1,5 +1,5 @@
 use clap::Parser;
-use kiss::mime_type;
+use kiss::{mime_type, parse_byte_range, ByteRange};
 use rustc_hash::FxHashMap;
 use std::fs::{metadata, read, read_dir};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -57,6 +57,7 @@ struct CacheEntry {
     complete_response: Arc<[u8]>,        // Pre-generated complete HTTP response
     header_length: usize,                // Where content starts in complete_response
     not_modified_response: Arc<[u8]>,    // Pre-generated 304 response
+    content_type: &'static str,          // Repeated on 206 responses, which are built per request
     etag: Arc<str>,                      // For ETag validation
     last_modified_str: Arc<str>,         // Pre-formatted Last-Modified value for fast comparison
     last_modified_timestamp: SystemTime, // For conditional requests
@@ -243,6 +244,7 @@ struct ParsedRequest<'a> {
     path: &'a str,
     if_modified_since: Option<&'a [u8]>,
     if_none_match: Option<&'a [u8]>,
+    range: Option<&'a [u8]>,
 }
 
 enum RequestError {
@@ -280,6 +282,7 @@ fn parse_request(buf: &[u8], header_end: usize) -> Result<ParsedRequest<'_>, Req
     let mut keep_alive = is_http11;
     let mut if_modified_since = None;
     let mut if_none_match = None;
+    let mut range = None;
 
     let mut pos = req_line_end + 1;
     while pos < header_end {
@@ -301,6 +304,8 @@ fn parse_request(buf: &[u8], header_end: usize) -> Result<ParsedRequest<'_>, Req
             if_modified_since = extract_header_value(line, b"if-modified-since:");
         } else if header_starts_with(line, b"if-none-match:") {
             if_none_match = extract_header_value(line, b"if-none-match:");
+        } else if header_starts_with(line, b"range:") {
+            range = extract_header_value(line, b"range:");
         }
     }
 
@@ -311,6 +316,7 @@ fn parse_request(buf: &[u8], header_end: usize) -> Result<ParsedRequest<'_>, Req
         path,
         if_modified_since,
         if_none_match,
+        range,
     })
 }
 
@@ -401,11 +407,12 @@ fn generate_cache_entry(
 
     let content = read(file_path)?;
     let etag = format!("W/\"{}-{}\"", content.len(), mtime_secs);
+    let content_type = mime_type(file_path);
 
     // Pre-combine headers + content so the hot path is a single write()
     let headers = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\nLast-Modified: {}\r\nETag: {}\r\nCache-Control: public, max-age=3600\r\nX-Content-Type-Options: nosniff\r\nConnection: keep-alive\r\n\r\n",
-        mime_type(file_path),
+        "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\nLast-Modified: {}\r\nETag: {}\r\nAccept-Ranges: bytes\r\nCache-Control: public, max-age=3600\r\nX-Content-Type-Options: nosniff\r\nConnection: keep-alive\r\n\r\n",
+        content_type,
         content.len(),
         last_modified_str,
         etag
@@ -424,6 +431,7 @@ fn generate_cache_entry(
         complete_response: complete_response.into(),
         header_length,
         not_modified_response: not_modified_response.into_bytes().into(),
+        content_type,
         etag: etag.into(),
         last_modified_str: last_modified_str.into(),
         last_modified_timestamp: last_modified,
@@ -674,6 +682,42 @@ async fn handle_request(
             .write_all(&entry.not_modified_response)
             .await
             .is_ok();
+    }
+
+    // Safari refuses to play media from a server that answers Range with 200,
+    // so partial responses are built here, off the pre-baked path.
+    if let Some(range) = req.range {
+        let body = &entry.complete_response[entry.header_length..];
+        let response = match parse_byte_range(range, body.len()) {
+            ByteRange::Part(start, end) => {
+                let head = format!(
+                    "HTTP/1.1 206 Partial Content\r\nContent-Type: {}\r\nContent-Length: {}\r\nContent-Range: bytes {}-{}/{}\r\nLast-Modified: {}\r\nETag: {}\r\nAccept-Ranges: bytes\r\nCache-Control: public, max-age=3600\r\nX-Content-Type-Options: nosniff\r\nConnection: keep-alive\r\n\r\n",
+                    entry.content_type,
+                    end - start + 1,
+                    start,
+                    end,
+                    body.len(),
+                    entry.last_modified_str,
+                    entry.etag
+                );
+                let mut response = head.into_bytes();
+                if !req.is_head {
+                    response.extend_from_slice(&body[start..=end]);
+                }
+                Some(response)
+            }
+            ByteRange::Unsatisfiable => Some(
+                format!(
+                    "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */{}\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n",
+                    body.len()
+                )
+                .into_bytes(),
+            ),
+            ByteRange::Ignore => None,
+        };
+        if let Some(response) = response {
+            return stream.write_all(&response).await.is_ok();
+        }
     }
 
     let end = if req.is_head {
