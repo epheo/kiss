@@ -107,6 +107,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn mime_types() {
+        for (path, expected) in [
+            ("index.html", "text/html; charset=utf-8"),
+            ("INDEX.HTM", "text/html; charset=utf-8"),
+            ("/css/site.CSS", "text/css; charset=utf-8"),
+            ("app.mjs", "text/javascript; charset=utf-8"),
+            ("data.json", "application/json; charset=utf-8"),
+            ("logo.svg", "image/svg+xml"),
+            ("photo.JPEG", "image/jpeg"),
+            ("font.woff2", "font/woff2"),
+            ("clip.mp4", "video/mp4"),
+            ("Dockerfile", "application/octet-stream"),
+            (".hidden", "application/octet-stream"),
+            ("file.", "application/octet-stream"),
+            ("archive.tar.xyz", "application/octet-stream"),
+        ] {
+            assert_eq!(mime_type(Path::new(path)), expected, "{path}");
+        }
+    }
+
+    #[test]
     fn byte_ranges() {
         assert_eq!(parse_byte_range(b"bytes=0-1", 100), ByteRange::Part(0, 1));
         assert_eq!(parse_byte_range(b"bytes=0-", 100), ByteRange::Part(0, 99));
