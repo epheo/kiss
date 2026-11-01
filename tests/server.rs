@@ -34,6 +34,24 @@ fn kiss() -> Command {
     cmd
 }
 
+/// Exit code and stderr of a kiss that should exit on its own. One that keeps
+/// serving is killed after 5 s, so a regression fails the test, not hangs it.
+fn exit_of(cmd: &mut Command) -> (Option<i32>, String) {
+    let mut child = cmd
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let start = Instant::now();
+    while child.try_wait().unwrap().is_none() && start.elapsed() < Duration::from_secs(5) {
+        thread::sleep(Duration::from_millis(20));
+    }
+    let _ = child.kill();
+    let output = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    (output.status.code(), stderr)
+}
+
 struct Server {
     child: Child,
     port: u16,
@@ -43,11 +61,11 @@ struct Server {
 
 impl Server {
     fn start() -> Self {
-        Self::with(content(SITE), &[], &[])
+        Self::with(content(SITE), &[])
     }
 
-    /// Configure through `KISS_*` variables, as in Kubernetes; `args` override them
-    fn with(content: TempDir, env: &[(&str, &str)], args: &[&str]) -> Self {
+    /// Configured, as in Kubernetes, through `KISS_*` environment variables
+    fn with(content: TempDir, env: &[(&str, &str)]) -> Self {
         // Another process can take the probed port before kiss binds it: retry
         for _ in 0..5 {
             let probe = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -58,22 +76,24 @@ impl Server {
                 .env("KISS_BIND_IP", "127.0.0.1")
                 .env("KISS_STATIC_DIR", content.path())
                 .envs(env.iter().copied())
-                .args(args)
                 .stdout(Stdio::piped())
                 .stderr(Stdio::null())
                 .spawn()
                 .unwrap();
-            // The address is printed once kiss accepts connections. The pipe
-            // stays open in `Server` so later log lines have somewhere to go.
+            // The version and address are logged once kiss accepts connections.
+            // The pipe stays open so later log lines have somewhere to go.
             let mut stdout = BufReader::new(child.stdout.take().unwrap());
             let mut lines = stdout.by_ref().lines().map_while(Result::ok);
-            if lines.any(|line| line.contains("http://")) {
-                return Server {
+            if let Some(line) = lines.find(|line| line.contains("http://")) {
+                // Built before asserting: its Drop kills kiss if the assert fails
+                let server = Server {
                     child,
                     port,
                     _stdout: stdout,
                     _content: content,
                 };
+                assert!(line.contains(env!("CARGO_PKG_VERSION")), "{line}");
+                return server;
             }
             child.wait().unwrap();
         }
@@ -249,7 +269,7 @@ fn missing_files_and_traversal_attempts_are_404() {
 
 #[test]
 fn custom_404_page() {
-    let server = Server::with(content(&[("404.html", "<h1>Nope</h1>")]), &[], &[]);
+    let server = Server::with(content(&[("404.html", "<h1>Nope</h1>")]), &[]);
     let r = server.get("/missing");
     assert_eq!(r.status, 404);
     assert_eq!(r.header("Content-Type"), Some("text/html"));
@@ -271,7 +291,7 @@ fn symlinks_and_oversized_files_are_not_served() {
     let huge = fs::File::create(site.path().join("huge.bin")).unwrap();
     huge.set_len(50 * 1024 * 1024 + 1).unwrap();
 
-    let server = Server::with(site, &[], &[]);
+    let server = Server::with(site, &[]);
     for path in ["/link.txt", "/linked/secret.txt", "/huge.bin"] {
         assert_eq!(server.get(path).status, 404, "{path}");
     }
@@ -407,18 +427,10 @@ fn oversized_requests_get_413() {
     // Headers that never end must not be buffered without bound
     assert_eq!(server.request(large.trim_end()).status, 413);
 
-    let server = Server::with(content(SITE), &[("KISS_MAX_REQUEST_SIZE", "100")], &[]);
+    let server = Server::with(content(SITE), &[("KISS_MAX_REQUEST_SIZE", "100")]);
     let request = format!("GET /{} HTTP/1.1\r\n\r\n", "a".repeat(100));
     assert_eq!(server.request(&request).status, 413);
     assert_eq!(server.get("/index.html").status, 200);
-}
-
-#[test]
-fn cli_flags_override_environment() {
-    let env = [("KISS_MAX_REQUEST_SIZE", "8192")];
-    let server = Server::with(content(SITE), &env, &["--max-request-size", "100"]);
-    let request = format!("GET /{} HTTP/1.1\r\n\r\n", "a".repeat(100));
-    assert_eq!(server.request(&request).status, 413);
 }
 
 #[test]
@@ -461,7 +473,7 @@ fn connection_header_and_http_version_control_persistence() {
 
 #[test]
 fn idle_and_incomplete_connections_time_out() {
-    let server = Server::with(content(SITE), &[("KISS_KEEPALIVE_TIMEOUT", "1")], &[]);
+    let server = Server::with(content(SITE), &[("KISS_KEEPALIVE_TIMEOUT", "1")]);
     let mut idle = server.connect();
     idle.send("GET /health HTTP/1.1\r\n\r\n");
     idle.response();
@@ -476,7 +488,7 @@ fn idle_and_incomplete_connections_time_out() {
 
 #[test]
 fn keep_alive_window_restarts_after_each_response() {
-    let server = Server::with(content(SITE), &[("KISS_KEEPALIVE_TIMEOUT", "1")], &[]);
+    let server = Server::with(content(SITE), &[("KISS_KEEPALIVE_TIMEOUT", "1")]);
     let mut conn = server.connect();
     // 4 requests spanning more than one window, each within a window of the last
     for _ in 0..4 {
@@ -527,7 +539,7 @@ fn graceful_shutdown_on_sigterm_and_sigint() {
 
 #[test]
 fn shutdown_answers_requests_on_open_connections_then_closes_them() {
-    let mut server = Server::with(content(SITE), &[("KISS_KEEPALIVE_TIMEOUT", "2")], &[]);
+    let mut server = Server::with(content(SITE), &[("KISS_KEEPALIVE_TIMEOUT", "2")]);
     let mut conn = server.connect();
     conn.send("GET /health HTTP/1.1\r\n\r\n");
     conn.response();
@@ -549,43 +561,31 @@ fn shutdown_answers_requests_on_open_connections_then_closes_them() {
 fn fails_when_port_is_taken() {
     let server = Server::start();
     let port = server.port.to_string();
-    let output = kiss()
-        .args(["-b", "127.0.0.1", "-p", &port])
-        .output()
-        .unwrap();
-    assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("bind"));
+    let (code, stderr) = exit_of(
+        kiss()
+            .env("KISS_BIND_IP", "127.0.0.1")
+            .env("KISS_PORT", &port),
+    );
+    assert!(code.is_some_and(|code| code != 0), "{code:?}");
+    assert!(stderr.contains("bind"), "{stderr}");
 }
 
 #[test]
-fn cli_help_version_and_validation() {
-    let help = kiss().arg("--help").output().unwrap();
-    assert!(help.status.success());
-    let help = String::from_utf8_lossy(&help.stdout);
-    for flag in [
-        "port",
-        "bind-ip",
-        "static-dir",
-        "max-request-size",
-        "keepalive-timeout",
-    ] {
-        assert!(
-            help.contains(&format!("--{flag}")),
-            "--{flag} missing from:\n{help}"
-        );
-    }
+fn rejects_arguments_and_invalid_settings() {
+    // Configuration is environment-only, so a flag is an error, not ignored
+    let (code, stderr) = exit_of(kiss().args(["--port", "9090"]));
+    assert_eq!(code, Some(2));
+    assert!(stderr.contains("KISS_"), "{stderr}");
 
-    let version = kiss().arg("--version").output().unwrap();
-    assert!(String::from_utf8_lossy(&version.stdout).contains(env!("CARGO_PKG_VERSION")));
-
-    for args in [
-        &["--port", "70000"][..],
-        &["--port", "http"],
-        &["--keepalive-timeout-secs", "0"],
-        &["--max-request-size", "-1"],
-        &["--no-such-flag"],
+    for (key, value) in [
+        ("KISS_PORT", "70000"),
+        ("KISS_PORT", "0"),
+        ("KISS_PORT", "http"),
+        ("KISS_KEEPALIVE_TIMEOUT", "0"),
+        ("KISS_MAX_REQUEST_SIZE", "-1"),
     ] {
-        let output = kiss().args(args).output().unwrap();
-        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        let (code, stderr) = exit_of(kiss().env(key, value));
+        assert_eq!(code, Some(2), "{key}={value}");
+        assert!(stderr.contains(key), "{stderr}");
     }
 }

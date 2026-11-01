@@ -2,12 +2,13 @@
 //! together with its complete HTTP response, so serving a request is a hash
 //! lookup and a single write.
 
-use clap::Parser;
 use std::collections::HashMap;
 use std::fs;
 use std::io;
+use std::num::{NonZeroU16, NonZeroU64};
 use std::path::Path;
 use std::pin::pin;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -15,36 +16,6 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::time::{Instant, sleep, sleep_until, timeout};
-
-/// KISS (Kubernetes Instant Static Server) - A fast static file server
-#[derive(Parser)]
-#[command(author, version, about, long_about = None)]
-struct Config {
-    /// Port to bind the server to
-    #[arg(short, long, env = "KISS_PORT", default_value_t = 8080, value_parser = clap::value_parser!(u16).range(1..))]
-    port: u16,
-
-    /// Maximum size of incoming requests in bytes
-    #[arg(
-        short = 'r',
-        long,
-        env = "KISS_MAX_REQUEST_SIZE",
-        default_value_t = 8192
-    )]
-    max_request_size: usize,
-
-    /// Directory to serve static files from
-    #[arg(short, long, env = "KISS_STATIC_DIR", default_value = "./content")]
-    static_dir: String,
-
-    /// Keep-alive timeout in seconds
-    #[arg(short, long, env = "KISS_KEEPALIVE_TIMEOUT", default_value_t = 5, value_parser = clap::value_parser!(u64).range(1..))]
-    keepalive_timeout_secs: u64,
-
-    /// IP address to bind the server to
-    #[arg(short, long, env = "KISS_BIND_IP", default_value = "0.0.0.0")]
-    bind_ip: String,
-}
 
 /// Files larger than this are skipped at startup to bound memory usage
 const MAX_FILE_SIZE: u64 = 50 * 1024 * 1024;
@@ -154,8 +125,11 @@ struct Server {
 }
 
 impl Server {
-    fn load(config: &Config) -> Self {
-        let dir = Path::new(&config.static_dir);
+    fn load() -> Self {
+        let static_dir: String = setting("STATIC_DIR", "./content");
+        let max_request_size = setting("MAX_REQUEST_SIZE", "8192");
+        let keepalive = setting::<NonZeroU64>("KEEPALIVE_TIMEOUT", "5");
+        let dir = Path::new(&static_dir);
         let mut files = HashMap::new();
         load_dir(dir, "", &mut files);
         println!("File cache built with {} entries", files.len());
@@ -171,8 +145,8 @@ impl Server {
             health: probe(br#"{"status":"healthy","timestamp":"0"}"#),
             ready: probe(br#"{"status":"ready","timestamp":"0"}"#),
             not_found,
-            max_request_size: config.max_request_size,
-            keepalive: Duration::from_secs(config.keepalive_timeout_secs),
+            max_request_size,
+            keepalive: Duration::from_secs(keepalive.get()),
         }
     }
 }
@@ -370,17 +344,34 @@ fn parse_byte_range(spec: &[u8], len: usize) -> ByteRange {
     }
 }
 
+/// The `KISS_<name>` environment variable, or `default` when unset. An invalid
+/// value exits with status 2 instead of silently falling back.
+fn setting<T: FromStr>(name: &str, default: &str) -> T {
+    let key = format!("KISS_{name}");
+    let value = std::env::var(&key).unwrap_or_else(|_| default.to_owned());
+    value.parse().unwrap_or_else(|_| {
+        eprintln!("Invalid {key}: {value:?}");
+        std::process::exit(2)
+    })
+}
+
 #[tokio::main]
 async fn main() {
-    let config = Config::parse();
+    // Configuration is environment-only: reject arguments rather than ignore them
+    if std::env::args_os().len() > 1 {
+        eprintln!("kiss takes no arguments: configure it with KISS_* environment variables");
+        std::process::exit(2);
+    }
+    let bind_ip: String = setting("BIND_IP", "0.0.0.0");
+    let port = setting::<NonZeroU16>("PORT", "8080").get();
     // Lives as long as the process, so connections share it without refcounting
-    let server: &'static Server = Box::leak(Box::new(Server::load(&config)));
+    let server: &'static Server = Box::leak(Box::new(Server::load()));
 
-    let listener = TcpListener::bind((config.bind_ip.as_str(), config.port))
+    let listener = TcpListener::bind((bind_ip.as_str(), port))
         .await
         .expect("Failed to bind to address");
     let address = listener.local_addr().expect("Failed to read bound address");
-    println!("Async KISS server running on http://{address}");
+    println!("KISS {} on http://{address}", env!("CARGO_PKG_VERSION"));
 
     let mut sigterm = signal(SignalKind::terminate()).expect("Failed to handle SIGTERM");
     let mut sigint = signal(SignalKind::interrupt()).expect("Failed to handle SIGINT");

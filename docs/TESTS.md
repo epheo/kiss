@@ -40,8 +40,8 @@ no test is `#[ignore]`d.
 - **Lifecycle**: graceful shutdown on `SIGTERM` and `SIGINT`, requests on open
   connections still answered during shutdown, and a clear failure when the port
   is taken.
-- **Configuration**: environment variables, CLI flags taking priority,
-  `--help`, `--version`, and rejection of invalid values with exit code 2.
+- **Configuration**: `KISS_*` environment variables, the version in the
+  startup log, and exit code 2 for invalid values or any argument.
 
 ## Benchmarks
 
