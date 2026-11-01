@@ -47,6 +47,7 @@ nginx wins on large files because sendfile() avoids copying content through user
 - Complete HTTP responses pre-generated (headers + content)
 - Zero disk I/O during request processing
 - Single write() system call per response
+- One read() and no heap allocation per request, so most CPU time is the kernel's TCP stack
 
 ### nginx (Disk-Based)
 

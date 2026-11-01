@@ -7,13 +7,14 @@ use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::path::Path;
+use std::pin::pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::signal::unix::{SignalKind, signal};
-use tokio::time::{Instant, sleep, timeout, timeout_at};
+use tokio::time::{Instant, sleep, sleep_until, timeout};
 
 /// KISS (Kubernetes Instant Static Server) - A fast static file server
 #[derive(Parser)]
@@ -419,11 +420,13 @@ async fn serve_connection(mut stream: TcpStream, server: &Server) {
     // bigger makes musl's allocator mmap and munmap for every connection.
     // Pipelined bytes beyond the current request stay buffered for the next.
     let mut buf = Vec::with_capacity(1024);
+    // Each request must arrive in full within one keep-alive window of the
+    // previous response (or of connecting). Rather than arming a timer per
+    // request, one timer is re-armed only when it fires before the deadline.
+    let mut deadline = Instant::now() + server.keepalive;
+    let mut timer = pin!(sleep_until(deadline));
 
     loop {
-        // Each request must arrive in full within one keep-alive window of the
-        // previous response (or of connecting)
-        let deadline = Instant::now() + server.keepalive;
         let mut start = 0;
         let head_len = loop {
             // The head must end within max_request_size bytes. Only new bytes
@@ -436,9 +439,19 @@ async fn serve_connection(mut stream: TcpStream, server: &Server) {
                 return close_with(&mut stream, REQUEST_TOO_LARGE, &mut buf).await;
             }
             start = buf.len().saturating_sub(3);
-            let read = timeout_at(deadline, stream.read_buf(&mut buf)).await;
-            if !matches!(read, Ok(Ok(1..))) {
-                return; // timed out, closed by the client, or failed
+            tokio::select! {
+                biased;
+                read = stream.read_buf(&mut buf) => {
+                    if !matches!(read, Ok(1..)) {
+                        return; // closed by the client, or failed
+                    }
+                }
+                () = &mut timer => {
+                    if Instant::now() >= deadline {
+                        return;
+                    }
+                    timer.as_mut().reset(deadline);
+                }
             }
         };
         let request = match parse_request(&buf[..head_len]) {
@@ -450,6 +463,7 @@ async fn serve_connection(mut stream: TcpStream, server: &Server) {
             return;
         }
         buf.drain(..head_len + 4);
+        deadline = Instant::now() + server.keepalive;
     }
 }
 
