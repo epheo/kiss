@@ -20,7 +20,7 @@ KISS implements comprehensive HTTP caching headers with file-caching architectur
 
 - **Zero filesystem metadata calls** during request handling
 - **Pre-compiled headers** eliminate string formatting overhead
-- **O(1) cache lookups** via FxHashMap with hash-based path resolution for instant header retrieval
+- **O(1) cache lookups**: one hash map lookup per request
 - **304 Not Modified** support reduces bandwidth usage
 
 ## Conditional Request Support
@@ -55,17 +55,26 @@ All responses include security headers:
 ### Cache Structure
 
 ```rust
-PathTrie {
-    exact_matches: FxHashMap<u32, CacheEntry>,
-    index_entries: FxHashMap<u32, CacheEntry>,
+Server {
+    files: HashMap<String, Arc<File>>, // URL path -> file; "/dir" and "/dir/index.html" share one File
+    health: Prebuilt,
+    ready: Prebuilt,
+    not_found: Prebuilt,               // From 404.html when present
+    ...
 }
 
-CacheEntry {
-    complete_response: Arc<[u8]>,     // Headers + content combined
-    headers_only: Arc<[u8]>,          // Headers for HEAD requests
-    not_modified_response: Arc<[u8]>, // Pre-generated 304 response
-    last_modified_timestamp: SystemTime,
-    etag: Arc<str>,
+File {
+    response: Prebuilt,         // Complete 200 response: headers + content
+    not_modified: Box<[u8]>,    // Complete 304 response
+    content_type: &'static str, // Repeated on 206 responses, built per request
+    etag: String,
+    last_modified: String,      // Compared byte-for-byte before parsing If-Modified-Since
+    modified: SystemTime,
+}
+
+Prebuilt {
+    bytes: Box<[u8]>,  // HEAD sends bytes[..header_len], GET sends all of it
+    header_len: usize,
 }
 ```
 
@@ -83,12 +92,8 @@ CacheEntry {
 
 ## Testing
 
-Comprehensive test suite covers:
-
-- **Unit Tests**: ETag generation, conditional logic, cache building (`cache_tests.rs`)
-- **Integration Tests**: HTTP conditional requests, header validation (`integration_tests.rs`)  
-- **Performance Tests**: Cache vs no-cache throughput, 304 response speed (`performance_tests.rs`)
-- **Edge Cases**: Malformed headers, concurrent requests, special characters (`edge_case_tests.rs`)
+`tests/server.rs` checks these headers end to end against the real binary,
+including conditional requests, `HEAD`, and range requests. See [TESTS.md](TESTS.md).
 
 ## Configuration
 

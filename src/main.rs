@@ -1,734 +1,583 @@
+//! KISS loads every file under the content directory into memory at startup,
+//! together with its complete HTTP response, so serving a request is a hash
+//! lookup and a single write.
+
 use clap::Parser;
-use kiss::{mime_type, parse_byte_range, ByteRange};
-use rustc_hash::FxHashMap;
-use std::fs::{metadata, read, read_dir};
+use std::collections::HashMap;
+use std::fs;
+use std::io;
+use std::path::Path;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::signal;
-use tokio::time::{sleep, timeout, Duration, Instant};
+use tokio::signal::unix::{SignalKind, signal};
+use tokio::time::{Instant, sleep, timeout, timeout_at};
 
 /// KISS (Kubernetes Instant Static Server) - A fast static file server
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
 struct Config {
     /// Port to bind the server to
-    #[arg(short, long, env = "KISS_PORT", default_value_t = 8080, value_parser = clap::value_parser!(u16).range(1..=65535))]
+    #[arg(short, long, env = "KISS_PORT", default_value_t = 8080, value_parser = clap::value_parser!(u16).range(1..))]
     port: u16,
 
     /// Maximum size of incoming requests in bytes
-    #[arg(short = 'r', long, env = "KISS_MAX_REQUEST_SIZE", default_value_t = 8192)]
+    #[arg(
+        short = 'r',
+        long,
+        env = "KISS_MAX_REQUEST_SIZE",
+        default_value_t = 8192
+    )]
     max_request_size: usize,
 
     /// Directory to serve static files from
-    #[arg(short = 's', long, env = "KISS_STATIC_DIR", default_value = "./content")]
+    #[arg(short, long, env = "KISS_STATIC_DIR", default_value = "./content")]
     static_dir: String,
 
     /// Keep-alive timeout in seconds
-    #[arg(short = 'k', long, env = "KISS_KEEPALIVE_TIMEOUT", default_value_t = 5, value_parser = clap::value_parser!(u64).range(1..))]
+    #[arg(short, long, env = "KISS_KEEPALIVE_TIMEOUT", default_value_t = 5, value_parser = clap::value_parser!(u64).range(1..))]
     keepalive_timeout_secs: u64,
 
     /// IP address to bind the server to
-    #[arg(short = 'b', long, env = "KISS_BIND_IP", default_value = "0.0.0.0")]
+    #[arg(short, long, env = "KISS_BIND_IP", default_value = "0.0.0.0")]
     bind_ip: String,
 }
 
-/// Files larger than this are skipped at cache build time to bound memory usage
+/// Files larger than this are skipped at startup to bound memory usage
 const MAX_FILE_SIZE: u64 = 50 * 1024 * 1024;
+
+// Errors close the connection, since the request boundary is unknown after a
+// parse failure, so they advertise Connection: close.
+const BAD_REQUEST: &[u8] = b"HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\nContent-Length: 17\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\nMalformed request";
+const METHOD_NOT_ALLOWED: &[u8] = b"HTTP/1.1 405 Method Not Allowed\r\nAllow: GET, HEAD\r\nContent-Type: text/plain\r\nContent-Length: 18\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\nMethod not allowed";
+const REQUEST_TOO_LARGE: &[u8] = b"HTTP/1.1 413 Request Entity Too Large\r\nContent-Type: text/plain\r\nContent-Length: 17\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\nRequest too large";
 
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 static ACTIVE_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
 
-/// Decrements the connection count when a connection task finishes, so
-/// shutdown can wait for in-flight requests to drain.
-struct ConnGuard;
-
-impl Drop for ConnGuard {
-    fn drop(&mut self) {
-        ACTIVE_CONNECTIONS.fetch_sub(1, Ordering::Release);
-    }
+/// A complete response built at startup. HEAD requests get just the headers.
+#[derive(Default)]
+struct Prebuilt {
+    bytes: Box<[u8]>,
+    header_len: usize,
 }
 
-// Cache entry for static files
-#[derive(Clone)]
-struct CacheEntry {
-    complete_response: Arc<[u8]>,        // Pre-generated complete HTTP response
-    header_length: usize,                // Where content starts in complete_response
-    not_modified_response: Arc<[u8]>,    // Pre-generated 304 response
-    content_type: &'static str,          // Repeated on 206 responses, which are built per request
-    etag: Arc<str>,                      // For ETag validation
-    last_modified_str: Arc<str>,         // Pre-formatted Last-Modified value for fast comparison
-    last_modified_timestamp: SystemTime, // For conditional requests
-}
-
-struct FileCache {
-    entries: FxHashMap<Box<str>, CacheEntry>,
-}
-
-impl FileCache {
-    fn new() -> Self {
+impl Prebuilt {
+    fn new(mut bytes: Vec<u8>, body: &[u8]) -> Self {
+        let header_len = bytes.len();
+        bytes.extend_from_slice(body);
         Self {
-            entries: FxHashMap::default(),
+            bytes: bytes.into(),
+            header_len,
         }
     }
 
-    // Strip query string and trailing slash, return normalized slice
-    #[inline]
-    fn normalize_path(path: &str) -> &str {
-        let bytes = path.as_bytes();
-        let mut end = bytes.iter().position(|&b| b == b'?').unwrap_or(bytes.len());
-        if end > 1 && bytes[end - 1] == b'/' {
-            end -= 1;
-        }
-        &path[..end]
-    }
-
-    fn insert(&mut self, path: &str, entry: CacheEntry) {
-        self.entries
-            .insert(Box::from(Self::normalize_path(path)), entry.clone());
-
-        // "/dir/index.html" is also served at "/dir" ("/" for the root index)
-        if let Some(dir_path) = path.strip_suffix("/index.html") {
-            let dir_norm = if dir_path.is_empty() {
-                "/"
-            } else {
-                Self::normalize_path(dir_path)
-            };
-            self.entries.insert(Box::from(dir_norm), entry);
-        }
-    }
-
-    fn get(&self, path: &str) -> Option<&CacheEntry> {
-        self.entries.get(Self::normalize_path(path))
-    }
-
-    fn entry_count(&self) -> usize {
-        self.entries.len()
-    }
-}
-
-// Static storage for header templates and file cache - initialized at startup
-static HEADER_TEMPLATES: OnceLock<HeaderTemplates> = OnceLock::new();
-static FILE_CACHE: OnceLock<FileCache> = OnceLock::new();
-
-// Pre-compiled responses: complete = headers + body, with the header length
-// kept where HEAD requests need a headers-only slice.
-struct HeaderTemplates {
-    not_found: Vec<u8>,
-    not_found_header_length: usize,
-    method_not_allowed: Vec<u8>,
-    request_too_large: Vec<u8>,
-    bad_request: Vec<u8>,
-    health: Vec<u8>,
-    health_header_length: usize,
-    ready: Vec<u8>,
-    ready_header_length: usize,
-}
-
-impl HeaderTemplates {
-    fn new(not_found_body: Option<Vec<u8>>) -> Self {
-        let (health, health_header_length) = Self::keep_alive_response(
-            "200 OK",
-            "application/json",
-            br#"{"status":"healthy","timestamp":"0"}"#,
-        );
-        let (ready, ready_header_length) = Self::keep_alive_response(
-            "200 OK",
-            "application/json",
-            br#"{"status":"ready","timestamp":"0"}"#,
-        );
-        let (not_found, not_found_header_length) = match not_found_body {
-            Some(body) => Self::keep_alive_response("404 Not Found", "text/html", &body),
-            None => Self::keep_alive_response("404 Not Found", "text/plain", b"File not found"),
-        };
-
-        Self {
-            not_found,
-            not_found_header_length,
-            // These errors always close the connection (the request boundary is
-            // unknown after a parse failure), so they advertise Connection: close.
-            method_not_allowed: b"HTTP/1.1 405 Method Not Allowed\r\nAllow: GET, HEAD\r\nContent-Type: text/plain\r\nContent-Length: 18\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\nMethod not allowed".to_vec(),
-            request_too_large: b"HTTP/1.1 413 Request Entity Too Large\r\nContent-Type: text/plain\r\nContent-Length: 17\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\nRequest too large".to_vec(),
-            bad_request: b"HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\nContent-Length: 17\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\nMalformed request".to_vec(),
-            health,
-            health_header_length,
-            ready,
-            ready_header_length,
-        }
-    }
-
-    /// Build a complete keep-alive response plus its header length for HEAD slicing
-    fn keep_alive_response(status: &str, content_type: &str, body: &[u8]) -> (Vec<u8>, usize) {
+    fn simple(status: &str, content_type: &str, body: &[u8]) -> Self {
         let headers = format!(
             "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nX-Content-Type-Options: nosniff\r\nConnection: keep-alive\r\n\r\n",
             body.len()
         );
-        let header_length = headers.len();
-        let mut complete = headers.into_bytes();
-        complete.extend_from_slice(body);
-        (complete, header_length)
+        Self::new(headers.into_bytes(), body)
+    }
+
+    fn for_method(&self, is_head: bool) -> &[u8] {
+        if is_head {
+            &self.bytes[..self.header_len]
+        } else {
+            &self.bytes
+        }
+    }
+
+    fn body(&self) -> &[u8] {
+        &self.bytes[self.header_len..]
     }
 }
 
-#[inline]
-fn header_starts_with(line: &[u8], prefix: &[u8]) -> bool {
-    line.len() >= prefix.len() && line[..prefix.len()].eq_ignore_ascii_case(prefix)
+struct File {
+    response: Prebuilt,
+    not_modified: Box<[u8]>,
+    content_type: &'static str,
+    etag: String,
+    last_modified: String,
+    modified: SystemTime,
 }
 
-#[inline]
-fn header_contains(line: &[u8], needle: &[u8]) -> bool {
-    line.windows(needle.len())
-        .any(|window| window.eq_ignore_ascii_case(needle))
-}
+impl File {
+    fn load(path: &Path) -> io::Result<Self> {
+        let metadata = fs::metadata(path)?;
+        if metadata.len() > MAX_FILE_SIZE {
+            return Err(io::Error::other("file exceeds the 50 MB cache limit"));
+        }
+        let body = fs::read(path)?;
 
-// Header value after "name:", with surrounding whitespace stripped
-fn extract_header_value<'a>(line: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
-    let value = line[name.len()..].trim_ascii_start();
-    (!value.is_empty()).then_some(value)
-}
-
-// RFC 7232 weak ETag comparison: match any comma-separated entry, ignoring
-// W/ prefixes and surrounding quotes
-fn etag_matches(if_none_match: &[u8], server_etag: &[u8]) -> bool {
-    if if_none_match == b"*" {
-        return true;
-    }
-    let server_tag = strip_etag_decoration(server_etag);
-    if_none_match
-        .split(|&b| b == b',')
-        .any(|entry| strip_etag_decoration(entry.trim_ascii()) == server_tag)
-}
-
-fn strip_etag_decoration(etag: &[u8]) -> &[u8] {
-    let s = etag.strip_prefix(b"W/").unwrap_or(etag);
-    s.strip_prefix(b"\"")
-        .and_then(|inner| inner.strip_suffix(b"\""))
-        .unwrap_or(s)
-}
-
-// Zero-allocation request line parser: "METHOD path HTTP/x.y"
-fn parse_request_line(line: &[u8]) -> Option<(&[u8], &str, &[u8])> {
-    let mut parts = line.split(|&b| b == b' ').filter(|part| !part.is_empty());
-
-    let method = parts.next()?;
-    let path_bytes = parts.next()?;
-    let version = parts.next()?;
-    if parts.next().is_some() {
-        return None;
+        // Whole seconds, matching the resolution of HTTP dates
+        let since_epoch = metadata.modified()?.duration_since(UNIX_EPOCH);
+        let mtime = since_epoch.map_or(0, |since_epoch| since_epoch.as_secs());
+        let modified = UNIX_EPOCH + Duration::from_secs(mtime);
+        let etag = format!("W/\"{}-{mtime}\"", body.len());
+        let not_modified = format!(
+            "HTTP/1.1 304 Not Modified\r\nETag: {etag}\r\nCache-Control: public, max-age=3600\r\nConnection: keep-alive\r\n\r\n"
+        );
+        let mut file = File {
+            response: Prebuilt::default(),
+            not_modified: not_modified.into_bytes().into(),
+            content_type: mime_type(path),
+            etag,
+            last_modified: httpdate::fmt_http_date(modified),
+            modified,
+        };
+        file.response = Prebuilt::new(file.headers("200 OK", body.len(), ""), &body);
+        Ok(file)
     }
 
-    let path = std::str::from_utf8(path_bytes).ok()?;
+    /// Headers of the 200 and 206 responses; `range` is a Content-Range line or empty
+    fn headers(&self, status: &str, length: usize, range: &str) -> Vec<u8> {
+        format!(
+            "HTTP/1.1 {status}\r\nContent-Type: {}\r\nContent-Length: {length}\r\n{range}Last-Modified: {}\r\nETag: {}\r\nAccept-Ranges: bytes\r\nCache-Control: public, max-age=3600\r\nX-Content-Type-Options: nosniff\r\nConnection: keep-alive\r\n\r\n",
+            self.content_type, self.last_modified, self.etag
+        )
+        .into_bytes()
+    }
+}
 
-    // Absolute-form URI (RFC 7230 §5.3.2): "http://host/path" → "/path"
-    let path = match path
-        .strip_prefix("http://")
-        .or_else(|| path.strip_prefix("https://"))
-    {
-        Some(rest) => match rest.find('/') {
-            Some(i) => &rest[i..],
-            None => "/",
-        },
-        None => path,
+/// Everything a connection needs, built once at startup
+struct Server {
+    files: HashMap<String, Arc<File>>,
+    health: Prebuilt,
+    ready: Prebuilt,
+    not_found: Prebuilt,
+    max_request_size: usize,
+    keepalive: Duration,
+}
+
+impl Server {
+    fn load(config: &Config) -> Self {
+        let dir = Path::new(&config.static_dir);
+        let mut files = HashMap::new();
+        load_dir(dir, "", &mut files);
+        println!("File cache built with {} entries", files.len());
+
+        // A 404.html in the content directory becomes the 404 body
+        let not_found = match fs::read(dir.join("404.html")) {
+            Ok(page) => Prebuilt::simple("404 Not Found", "text/html", &page),
+            Err(_) => Prebuilt::simple("404 Not Found", "text/plain", b"File not found"),
+        };
+        let probe = |body: &[u8]| Prebuilt::simple("200 OK", "application/json", body);
+        Server {
+            files,
+            health: probe(br#"{"status":"healthy","timestamp":"0"}"#),
+            ready: probe(br#"{"status":"ready","timestamp":"0"}"#),
+            not_found,
+            max_request_size: config.max_request_size,
+            keepalive: Duration::from_secs(config.keepalive_timeout_secs),
+        }
+    }
+}
+
+/// Cache every regular file under `dir`, keyed by URL path. `file_type()` does
+/// not follow symlinks, so links, which could point outside the content
+/// directory, are neither served nor traversed.
+fn load_dir(dir: &Path, url_prefix: &str, files: &mut HashMap<String, Arc<File>>) {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) => return eprintln!("Warning: skipping {}: {e}", dir.display()),
     };
-
-    Some((method, path, version))
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        let path = entry.path();
+        let url = format!("{url_prefix}/{}", entry.file_name().to_string_lossy());
+        if file_type.is_dir() {
+            load_dir(&path, &url, files);
+        } else if file_type.is_file() {
+            match File::load(&path) {
+                Ok(file) => {
+                    let file = Arc::new(file);
+                    // "/dir/index.html" is also served at "/dir", and "/index.html" at "/"
+                    if let Some(dir_url) = url.strip_suffix("/index.html") {
+                        let dir_url = if dir_url.is_empty() { "/" } else { dir_url };
+                        files.insert(dir_url.to_string(), Arc::clone(&file));
+                    }
+                    files.insert(url, file);
+                }
+                Err(e) => eprintln!("Warning: skipping {}: {e}", path.display()),
+            }
+        }
+    }
 }
 
-/// A parsed request borrowing directly from the connection buffer — no copies
-struct ParsedRequest<'a> {
-    consumed: usize,
+/// Map a file extension to its MIME type
+fn mime_type(path: &Path) -> &'static str {
+    let Some(extension) = path.extension().and_then(|ext| ext.to_str()) else {
+        return "application/octet-stream";
+    };
+    match extension.to_ascii_lowercase().as_str() {
+        "html" | "htm" => "text/html; charset=utf-8",
+        "css" => "text/css; charset=utf-8",
+        "js" | "mjs" => "text/javascript; charset=utf-8",
+        "json" => "application/json; charset=utf-8",
+        "webmanifest" => "application/manifest+json",
+        "xml" => "application/xml; charset=utf-8",
+        "txt" => "text/plain; charset=utf-8",
+        "ico" => "image/x-icon",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "avif" => "image/avif",
+        "svg" => "image/svg+xml",
+        "mp4" | "m4v" => "video/mp4",
+        "webm" => "video/webm",
+        "mp3" => "audio/mpeg",
+        "ogg" => "audio/ogg",
+        "wav" => "audio/wav",
+        "pdf" => "application/pdf",
+        "woff" => "font/woff",
+        "woff2" => "font/woff2",
+        "ttf" => "font/ttf",
+        "eot" => "application/vnd.ms-fontobject",
+        _ => "application/octet-stream",
+    }
+}
+
+/// A request, borrowing from the connection buffer
+#[derive(Default)]
+struct Request<'a> {
+    path: &'a str,
     is_head: bool,
     keep_alive: bool,
-    path: &'a str,
-    if_modified_since: Option<&'a [u8]>,
     if_none_match: Option<&'a [u8]>,
+    if_modified_since: Option<&'a [u8]>,
     range: Option<&'a [u8]>,
 }
 
-enum RequestError {
-    Malformed,
-    MethodNotAllowed,
-}
-
-/// Find \r\n\r\n, returning the index of its first byte
-#[inline]
-fn find_header_end(buf: &[u8]) -> Option<usize> {
-    buf.windows(4).position(|window| window == b"\r\n\r\n")
-}
-
-/// Parse one request whose headers end at `header_end` (as found by find_header_end)
-fn parse_request(buf: &[u8], header_end: usize) -> Result<ParsedRequest<'_>, RequestError> {
-    let consumed = header_end + 4;
-
-    // A '\n' always exists at header_end + 1, so the fallback is unreachable
-    let req_line_end = buf
-        .iter()
-        .position(|&b| b == b'\n')
-        .unwrap_or(header_end + 1);
-    let request_line = buf[..req_line_end].trim_ascii();
-    if request_line.is_empty() {
-        return Err(RequestError::Malformed);
-    }
-
-    let (method, path, version) =
-        parse_request_line(request_line).ok_or(RequestError::Malformed)?;
-    if method != b"GET" && method != b"HEAD" {
-        return Err(RequestError::MethodNotAllowed);
-    }
-
-    let is_http11 = version == b"HTTP/1.1";
-    let mut keep_alive = is_http11;
-    let mut if_modified_since = None;
-    let mut if_none_match = None;
-    let mut range = None;
-
-    let mut pos = req_line_end + 1;
-    while pos < header_end {
-        let line_end = buf[pos..header_end]
-            .iter()
-            .position(|&b| b == b'\n')
-            .map_or(header_end, |offset| pos + offset);
-        let line = buf[pos..line_end].trim_ascii();
-        pos = line_end + 1;
-
-        if line.is_empty() {
-            continue;
+/// Parse a request head (everything before the blank line). An error is the
+/// response to send before closing the connection.
+fn parse_request(head: &[u8]) -> Result<Request<'_>, &'static [u8]> {
+    let mut lines = head.split(|&b| b == b'\n').map(<[u8]>::trim_ascii);
+    let request_line = lines.next().unwrap_or_default();
+    let request_line = std::str::from_utf8(request_line).map_err(|_| BAD_REQUEST)?;
+    let mut parts = request_line.split_ascii_whitespace();
+    let (Some(method), Some(target), Some(version), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return Err(BAD_REQUEST);
+    };
+    let is_head = match method {
+        "GET" => false,
+        "HEAD" => true,
+        _ => return Err(METHOD_NOT_ALLOWED),
+    };
+    // Absolute-form target (RFC 7230 §5.3.2): "http://host/path" → "/path"
+    let path = match target.split_once("://") {
+        Some((_scheme, rest)) if !target.starts_with('/') => {
+            rest.find('/').map_or("/", |i| &rest[i..])
         }
+        _ => target,
+    };
 
-        if header_starts_with(line, b"connection:") {
-            keep_alive = !header_contains(line, b"close")
-                && (is_http11 || header_contains(line, b"keep-alive"));
-        } else if header_starts_with(line, b"if-modified-since:") {
-            if_modified_since = extract_header_value(line, b"if-modified-since:");
-        } else if header_starts_with(line, b"if-none-match:") {
-            if_none_match = extract_header_value(line, b"if-none-match:");
-        } else if header_starts_with(line, b"range:") {
-            range = extract_header_value(line, b"range:");
-        }
-    }
-
-    Ok(ParsedRequest {
-        consumed,
-        is_head: method == b"HEAD",
-        keep_alive,
+    let is_http11 = version == "HTTP/1.1";
+    let mut request = Request {
         path,
-        if_modified_since,
-        if_none_match,
-        range,
-    })
-}
-
-fn build_file_cache(static_dir: &str) -> FileCache {
-    let mut cache = FileCache::new();
-
-    if let Err(e) = discover_files_recursive(static_dir, "", &mut cache) {
-        eprintln!("Warning: Failed to build file cache: {}", e);
-    }
-
-    println!("File cache built with {} entries", cache.entry_count());
-    cache
-}
-
-fn discover_files_recursive(
-    base_dir: &str,
-    relative_path: &str,
-    cache: &mut FileCache,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let mut full_path = String::with_capacity(base_dir.len() + relative_path.len() + 1);
-    full_path.push_str(base_dir);
-    if !relative_path.is_empty() {
-        full_path.push('/');
-        full_path.push_str(relative_path);
-    }
-
-    for entry in read_dir(&full_path)? {
-        let entry = entry?;
-        let file_type = entry.file_type()?;
-
-        // Skip symlinks to prevent directory escape
-        if file_type.is_symlink() {
+        is_head,
+        keep_alive: is_http11,
+        ..Default::default()
+    };
+    for line in lines {
+        let Some(colon) = line.iter().position(|&b| b == b':') else {
             continue;
-        }
-
-        let file_name_os = entry.file_name();
-        let file_name = file_name_os.to_string_lossy();
-
-        let current_relative = if relative_path.is_empty() {
-            file_name.to_string()
-        } else {
-            let mut path = String::with_capacity(relative_path.len() + file_name.len() + 1);
-            path.push_str(relative_path);
-            path.push('/');
-            path.push_str(&file_name);
-            path
         };
-
-        if file_type.is_file() {
-            match generate_cache_entry(&entry.path()) {
-                Ok(cache_entry) => {
-                    let mut url_path = String::with_capacity(current_relative.len() + 1);
-                    url_path.push('/');
-                    url_path.push_str(&current_relative);
-                    cache.insert(&url_path, cache_entry);
-                }
-                Err(e) => eprintln!("Warning: skipping {}: {}", entry.path().display(), e),
-            }
-        } else if file_type.is_dir() {
-            discover_files_recursive(base_dir, &current_relative, cache)?;
+        let (name, value) = (&line[..colon], line[colon + 1..].trim_ascii());
+        if name.eq_ignore_ascii_case(b"connection") {
+            request.keep_alive = !contains_ignore_case(value, b"close")
+                && (is_http11 || contains_ignore_case(value, b"keep-alive"));
+        } else if name.eq_ignore_ascii_case(b"if-none-match") {
+            request.if_none_match = Some(value);
+        } else if name.eq_ignore_ascii_case(b"if-modified-since") {
+            request.if_modified_since = Some(value);
+        } else if name.eq_ignore_ascii_case(b"range") {
+            request.range = Some(value);
         }
     }
-
-    Ok(())
+    Ok(request)
 }
 
-fn generate_cache_entry(
-    file_path: &std::path::Path,
-) -> Result<CacheEntry, Box<dyn std::error::Error>> {
-    let file_metadata = metadata(file_path)?;
-    if file_metadata.len() > MAX_FILE_SIZE {
-        return Err(format!(
-            "file exceeds the {} MB cache limit",
-            MAX_FILE_SIZE / (1024 * 1024)
-        )
-        .into());
+fn contains_ignore_case(text: &[u8], word: &[u8]) -> bool {
+    text.windows(word.len())
+        .any(|w| w.eq_ignore_ascii_case(word))
+}
+
+/// Cache key for a request path: no query string, no trailing slash
+fn cache_key(path: &str) -> &str {
+    let path = path.split_once('?').map_or(path, |(path, _query)| path);
+    path.strip_suffix('/')
+        .filter(|dir| !dir.is_empty())
+        .unwrap_or(path)
+}
+
+/// RFC 7232 weak comparison: match any comma-separated entry, ignoring W/
+/// prefixes and surrounding quotes
+fn etag_matches(if_none_match: &[u8], etag: &[u8]) -> bool {
+    fn opaque(tag: &[u8]) -> &[u8] {
+        let tag = tag.strip_prefix(b"W/").unwrap_or(tag);
+        tag.strip_prefix(b"\"")
+            .and_then(|t| t.strip_suffix(b"\""))
+            .unwrap_or(tag)
     }
+    if_none_match == b"*"
+        || if_none_match
+            .split(|&b| b == b',')
+            .any(|tag| opaque(tag.trim_ascii()) == opaque(etag))
+}
 
-    // Truncate mtime to whole seconds to match HTTP date resolution
-    let mtime_secs = file_metadata
-        .modified()
-        .unwrap_or(SystemTime::UNIX_EPOCH)
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or(Duration::ZERO)
-        .as_secs();
-    let last_modified = SystemTime::UNIX_EPOCH + Duration::from_secs(mtime_secs);
-    let last_modified_str = httpdate::fmt_http_date(last_modified);
+/// Outcome of a Range header against a body of known length (RFC 7233)
+#[derive(Debug, PartialEq, Eq)]
+enum ByteRange {
+    /// Inclusive byte offsets into the body
+    Part(usize, usize),
+    /// 416: the request names bytes the body does not have
+    Unsatisfiable,
+    /// Unparseable or multi-range: the header is ignored and the full body served
+    Ignore,
+}
 
-    let content = read(file_path)?;
-    let etag = format!("W/\"{}-{}\"", content.len(), mtime_secs);
-    let content_type = mime_type(file_path);
-
-    // Pre-combine headers + content so the hot path is a single write()
-    let headers = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\nLast-Modified: {}\r\nETag: {}\r\nAccept-Ranges: bytes\r\nCache-Control: public, max-age=3600\r\nX-Content-Type-Options: nosniff\r\nConnection: keep-alive\r\n\r\n",
-        content_type,
-        content.len(),
-        last_modified_str,
-        etag
-    );
-    let header_length = headers.len();
-    let mut complete_response = headers.into_bytes();
-    complete_response.reserve_exact(content.len());
-    complete_response.extend_from_slice(&content);
-
-    let not_modified_response = format!(
-        "HTTP/1.1 304 Not Modified\r\nETag: {}\r\nCache-Control: public, max-age=3600\r\nConnection: keep-alive\r\n\r\n",
-        etag
-    );
-
-    Ok(CacheEntry {
-        complete_response: complete_response.into(),
-        header_length,
-        not_modified_response: not_modified_response.into_bytes().into(),
-        content_type,
-        etag: etag.into(),
-        last_modified_str: last_modified_str.into(),
-        last_modified_timestamp: last_modified,
-    })
+/// Parse a single `bytes=` range. Multi-range requests are ignored rather than
+/// answered with multipart/byteranges, which no browser media stack needs.
+fn parse_byte_range(spec: &[u8], len: usize) -> ByteRange {
+    use ByteRange::{Ignore, Part, Unsatisfiable};
+    let spec = std::str::from_utf8(spec).unwrap_or_default().trim();
+    let Some((first, last)) = spec
+        .get(..6)
+        .filter(|unit| unit.eq_ignore_ascii_case("bytes=") && !spec.contains(','))
+        .and_then(|_| spec[6..].trim().split_once('-'))
+    else {
+        return Ignore;
+    };
+    // `str::parse` alone would also accept a leading '+'
+    let number = |n: &str| n.parse::<usize>().ok().filter(|_| !n.starts_with('+'));
+    match (number(first), number(last)) {
+        // Suffix form "-n": the last n bytes
+        (None, Some(n)) if first.is_empty() && n > 0 && len > 0 => Part(len - n.min(len), len - 1),
+        (None, Some(_)) if first.is_empty() => Unsatisfiable,
+        (Some(start), _) if start >= len => Unsatisfiable,
+        (Some(start), None) if last.is_empty() => Part(start, len - 1),
+        (Some(start), Some(end)) if end >= start => Part(start, end.min(len - 1)),
+        _ => Ignore,
+    }
 }
 
 #[tokio::main]
 async fn main() {
-    // Parse CLI arguments and environment once - zero runtime overhead thereafter
     let config = Config::parse();
+    // Lives as long as the process, so connections share it without refcounting
+    let server: &'static Server = Box::leak(Box::new(Server::load(&config)));
 
-    // Initialize header templates and file cache before accepting traffic.
-    // A 404.html in the content dir becomes the pre-generated 404 body,
-    // read once here so runtime stays free of filesystem operations.
-    let not_found_body = read(format!("{}/404.html", config.static_dir)).ok();
-    assert!(
-        HEADER_TEMPLATES.set(HeaderTemplates::new(not_found_body)).is_ok(),
-        "header templates already initialized"
-    );
-    assert!(
-        FILE_CACHE.set(build_file_cache(&config.static_dir)).is_ok(),
-        "file cache already initialized"
-    );
-
-    run_server(
-        &config.bind_ip,
-        config.port,
-        config.max_request_size,
-        Duration::from_secs(config.keepalive_timeout_secs),
-    )
-    .await;
-}
-
-async fn run_server(bind_ip: &str, port: u16, max_request_size: usize, keepalive: Duration) {
-    let listener = TcpListener::bind(format!("{bind_ip}:{port}"))
+    let listener = TcpListener::bind((config.bind_ip.as_str(), config.port))
         .await
         .expect("Failed to bind to address");
+    let address = listener.local_addr().expect("Failed to read bound address");
+    println!("Async KISS server running on http://{address}");
 
-    println!("Async KISS server running on http://{bind_ip}:{port}");
-
-    // Install signal handlers once, outside the accept loop
-    let shutdown = shutdown_signal();
-    tokio::pin!(shutdown);
-
+    let mut sigterm = signal(SignalKind::terminate()).expect("Failed to handle SIGTERM");
+    let mut sigint = signal(SignalKind::interrupt()).expect("Failed to handle SIGINT");
     loop {
         tokio::select! {
-            result = listener.accept() => {
-                match result {
-                    Ok((stream, _)) => {
-                        let _ = stream.set_nodelay(true);
-                        ACTIVE_CONNECTIONS.fetch_add(1, Ordering::Relaxed);
-                        tokio::spawn(async move {
-                            let _guard = ConnGuard;
-                            handle_connection(stream, max_request_size, keepalive).await;
-                        });
-                    }
-                    // Transient accept failure (e.g. fd exhaustion): back off instead of spinning
-                    Err(_) => sleep(Duration::from_millis(10)).await,
+            accepted = listener.accept() => match accepted {
+                Ok((stream, _)) => {
+                    let _ = stream.set_nodelay(true);
+                    ACTIVE_CONNECTIONS.fetch_add(1, Ordering::Relaxed);
+                    tokio::spawn(async move {
+                        serve_connection(stream, server).await;
+                        ACTIVE_CONNECTIONS.fetch_sub(1, Ordering::Release);
+                    });
                 }
-            }
-            _ = &mut shutdown => {
-                println!("Shutdown signal received, stopping server...");
-                SHUTDOWN.store(true, Ordering::Relaxed);
-                break;
-            }
+                // Transient failure such as fd exhaustion: back off instead of spinning
+                Err(_) => sleep(Duration::from_millis(10)).await,
+            },
+            _ = sigterm.recv() => break,
+            _ = sigint.recv() => break,
         }
     }
 
-    // Stop accepting, then drain: idle connections notice the shutdown flag
-    // within one keepalive window, in-flight responses get a grace period.
+    // Stop accepting, then drain: idle connections close within one keep-alive
+    // window, and in-flight responses get a grace period on top.
+    println!("Shutdown signal received, stopping server...");
+    SHUTDOWN.store(true, Ordering::Relaxed);
     drop(listener);
-    let deadline = Instant::now() + keepalive + Duration::from_secs(2);
+    let deadline = Instant::now() + server.keepalive + Duration::from_secs(2);
     while ACTIVE_CONNECTIONS.load(Ordering::Acquire) > 0 && Instant::now() < deadline {
         sleep(Duration::from_millis(25)).await;
     }
-
     println!("Server shutdown complete");
 }
 
-async fn shutdown_signal() {
-    let ctrl_c = async {
-        signal::ctrl_c()
-            .await
-            .expect("failed to install Ctrl+C handler");
-    };
-
-    #[cfg(unix)]
-    let terminate = async {
-        signal::unix::signal(signal::unix::SignalKind::terminate())
-            .expect("failed to install signal handler")
-            .recv()
-            .await;
-    };
-
-    #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
-
-    tokio::select! {
-        _ = ctrl_c => {},
-        _ = terminate => {},
-    }
-}
-
-/// Send a fatal error response, then FIN and briefly drain unread request
-/// bytes so the client can read the response before the socket closes
-/// (closing with a non-empty receive queue would send a RST that destroys it).
-async fn send_final_response(stream: &mut TcpStream, response: &[u8]) {
-    if stream.write_all(response).await.is_err() {
-        return;
-    }
-    let _ = stream.shutdown().await;
-
-    let mut discard = [0u8; 4096];
-    let deadline = Instant::now() + Duration::from_secs(2);
-    loop {
-        let wait = deadline.saturating_duration_since(Instant::now());
-        match timeout(wait, stream.read(&mut discard)).await {
-            Ok(Ok(n)) if n > 0 => continue,
-            // EOF, error, or drain deadline reached
-            _ => break,
-        }
-    }
-}
-
-async fn handle_connection(mut stream: TcpStream, max_request_size: usize, keepalive: Duration) {
-    let templates = HEADER_TEMPLATES.get().unwrap();
-    let file_cache = FILE_CACHE.get().unwrap();
-
-    // Single per-connection buffer, reused across requests. Pipelined bytes
-    // beyond the current request stay in the buffer for the next iteration.
-    // Requests rarely exceed 1 KB and larger ones grow it; starting at 8 KB
-    // made musl's allocator mmap and munmap memory for most connections.
-    let mut buf: Vec<u8> = Vec::with_capacity(max_request_size.min(1024));
+async fn serve_connection(mut stream: TcpStream, server: &Server) {
+    // Requests rarely exceed 1 KB and larger ones grow the buffer; starting
+    // bigger makes musl's allocator mmap and munmap for every connection.
+    // Pipelined bytes beyond the current request stay buffered for the next.
+    let mut buf = Vec::with_capacity(1024);
 
     loop {
-        // Read until buf holds a complete header block. The keepalive window
-        // bounds the idle wait for a first byte; once bytes arrive, the full
-        // headers must land within one more window (anti-slowloris deadline).
-        let mut deadline: Option<Instant> = None;
-        let header_end = loop {
-            if let Some(i) = find_header_end(&buf) {
-                if i + 4 > max_request_size {
-                    send_final_response(&mut stream, &templates.request_too_large).await;
-                    return;
-                }
-                break i;
+        // Each request must arrive in full within one keep-alive window of the
+        // previous response (or of connecting)
+        let deadline = Instant::now() + server.keepalive;
+        let mut start = 0;
+        let head_len = loop {
+            // The head must end within max_request_size bytes. Only new bytes
+            // need scanning, plus 3 for a terminator split across reads.
+            let limit = buf.len().min(server.max_request_size);
+            if let Some(i) = buf[start..limit].windows(4).position(|w| w == b"\r\n\r\n") {
+                break start + i;
             }
-            if buf.len() >= max_request_size {
-                send_final_response(&mut stream, &templates.request_too_large).await;
-                return;
+            if buf.len() >= server.max_request_size {
+                return close_with(&mut stream, REQUEST_TOO_LARGE, &mut buf).await;
             }
-
-            if SHUTDOWN.load(Ordering::Relaxed) {
-                return;
-            }
-
-            // Fast path (empty buf, whole request in one read) never touches the
-            // clock; the deadline is armed only once a partial request is buffered.
-            let wait = if buf.is_empty() {
-                keepalive
-            } else {
-                deadline
-                    .get_or_insert_with(|| Instant::now() + keepalive)
-                    .saturating_duration_since(Instant::now())
-            };
-            match timeout(wait, stream.read_buf(&mut buf)).await {
-                Ok(Ok(n)) if n > 0 => {}
-                // Peer closed, IO error, or timed out
-                _ => return,
+            start = buf.len().saturating_sub(3);
+            let read = timeout_at(deadline, stream.read_buf(&mut buf)).await;
+            if !matches!(read, Ok(Ok(1..))) {
+                return; // timed out, closed by the client, or failed
             }
         };
-
-        let parsed = match parse_request(&buf, header_end) {
-            Ok(parsed) => parsed,
-            Err(RequestError::MethodNotAllowed) => {
-                send_final_response(&mut stream, &templates.method_not_allowed).await;
-                return;
-            }
-            Err(RequestError::Malformed) => {
-                send_final_response(&mut stream, &templates.bad_request).await;
-                return;
-            }
+        let request = match parse_request(&buf[..head_len]) {
+            Ok(request) => request,
+            Err(response) => return close_with(&mut stream, response, &mut buf).await,
         };
-
-        let consumed = parsed.consumed;
-        let keep_alive = parsed.keep_alive;
-        let ok = handle_request(&mut stream, templates, file_cache, &parsed).await;
-        if consumed == buf.len() {
-            buf.clear();
-        } else {
-            // Keep pipelined bytes belonging to the next request
-            buf.drain(..consumed);
-        }
-
-        if !ok || !keep_alive {
+        let sent = respond(&mut stream, server, &request).await;
+        if sent.is_err() || !request.keep_alive || SHUTDOWN.load(Ordering::Relaxed) {
             return;
         }
+        buf.drain(..head_len + 4);
     }
 }
 
-async fn handle_request(
-    stream: &mut TcpStream,
-    templates: &HeaderTemplates,
-    file_cache: &FileCache,
-    req: &ParsedRequest<'_>,
-) -> bool {
-    if req.path == "/health" {
-        let end = if req.is_head {
-            templates.health_header_length
-        } else {
-            templates.health.len()
+/// Send a final error response, then half-close and briefly drain what the
+/// client is still sending: closing with unread data would send a RST, which
+/// can destroy the response before the client reads it.
+async fn close_with(stream: &mut TcpStream, response: &[u8], buf: &mut Vec<u8>) {
+    if stream.write_all(response).await.is_ok() && stream.shutdown().await.is_ok() {
+        let drain = async {
+            while let Ok(1..) = stream.read_buf(buf).await {
+                buf.clear();
+            }
         };
-        return stream.write_all(&templates.health[..end]).await.is_ok();
+        let _ = timeout(Duration::from_secs(2), drain).await;
     }
+}
 
-    if req.path == "/ready" {
-        let end = if req.is_head {
-            templates.ready_header_length
-        } else {
-            templates.ready.len()
-        };
-        return stream.write_all(&templates.ready[..end]).await.is_ok();
-    }
-
-    let Some(entry) = file_cache.get(req.path) else {
-        let end = if req.is_head {
-            templates.not_found_header_length
-        } else {
-            templates.not_found.len()
-        };
-        return stream.write_all(&templates.not_found[..end]).await.is_ok();
+async fn respond(stream: &mut TcpStream, server: &Server, request: &Request<'_>) -> io::Result<()> {
+    let prebuilt = match request.path {
+        "/health" => &server.health,
+        "/ready" => &server.ready,
+        path => match server.files.get(cache_key(path)) {
+            Some(file) => return send_file(stream, file, request).await,
+            None => &server.not_found,
+        },
     };
+    stream.write_all(prebuilt.for_method(request.is_head)).await
+}
 
-    // RFC 7232 §6: If-None-Match takes precedence; If-Modified-Since applies
-    // only when no ETag was sent.
-    let not_modified = match (req.if_none_match, req.if_modified_since) {
-        (Some(inm), _) => etag_matches(inm, entry.etag.as_bytes()),
-        (None, Some(ims)) => {
-            // Fast path: clients usually echo our Last-Modified value byte-for-byte
-            ims == entry.last_modified_str.as_bytes()
-                || std::str::from_utf8(ims)
+async fn send_file(stream: &mut TcpStream, file: &File, request: &Request<'_>) -> io::Result<()> {
+    // RFC 7232 §6: If-None-Match takes precedence over If-Modified-Since
+    let not_modified = match (request.if_none_match, request.if_modified_since) {
+        (Some(tags), _) => etag_matches(tags, file.etag.as_bytes()),
+        // Clients usually echo Last-Modified verbatim, so compare bytes before parsing
+        (None, Some(since)) => {
+            since == file.last_modified.as_bytes()
+                || std::str::from_utf8(since)
                     .ok()
-                    .and_then(|s| httpdate::parse_http_date(s).ok())
-                    .is_some_and(|t| entry.last_modified_timestamp <= t)
+                    .and_then(|since| httpdate::parse_http_date(since).ok())
+                    .is_some_and(|since| file.modified <= since)
         }
         (None, None) => false,
     };
     if not_modified {
-        return stream
-            .write_all(&entry.not_modified_response)
-            .await
-            .is_ok();
+        return stream.write_all(&file.not_modified).await;
     }
 
-    // Safari refuses to play media from a server that answers Range with 200,
-    // so partial responses are built here, off the pre-baked path.
-    if let Some(range) = req.range {
-        let body = &entry.complete_response[entry.header_length..];
-        let response = match parse_byte_range(range, body.len()) {
+    // Safari won't play media from a server that answers Range with a 200, so
+    // partial responses are built per request, off the pre-built path.
+    if let Some(range) = request.range {
+        let body = file.response.body();
+        let len = body.len();
+        match parse_byte_range(range, len) {
             ByteRange::Part(start, end) => {
-                let head = format!(
-                    "HTTP/1.1 206 Partial Content\r\nContent-Type: {}\r\nContent-Length: {}\r\nContent-Range: bytes {}-{}/{}\r\nLast-Modified: {}\r\nETag: {}\r\nAccept-Ranges: bytes\r\nCache-Control: public, max-age=3600\r\nX-Content-Type-Options: nosniff\r\nConnection: keep-alive\r\n\r\n",
-                    entry.content_type,
-                    end - start + 1,
-                    start,
-                    end,
-                    body.len(),
-                    entry.last_modified_str,
-                    entry.etag
-                );
-                let mut response = head.into_bytes();
-                if !req.is_head {
+                let range = format!("Content-Range: bytes {start}-{end}/{len}\r\n");
+                let mut response = file.headers("206 Partial Content", end - start + 1, &range);
+                if !request.is_head {
                     response.extend_from_slice(&body[start..=end]);
                 }
-                Some(response)
+                return stream.write_all(&response).await;
             }
-            ByteRange::Unsatisfiable => Some(
-                format!(
-                    "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */{}\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n",
-                    body.len()
-                )
-                .into_bytes(),
-            ),
-            ByteRange::Ignore => None,
-        };
-        if let Some(response) = response {
-            return stream.write_all(&response).await.is_ok();
+            ByteRange::Unsatisfiable => {
+                let response = format!(
+                    "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */{len}\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n"
+                );
+                return stream.write_all(response.as_bytes()).await;
+            }
+            ByteRange::Ignore => {}
+        }
+    }
+    let response = file.response.for_method(request.is_head);
+    stream.write_all(response).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mime_types() {
+        for (path, expected) in [
+            ("index.html", "text/html; charset=utf-8"),
+            ("INDEX.HTM", "text/html; charset=utf-8"),
+            ("/css/site.CSS", "text/css; charset=utf-8"),
+            ("app.mjs", "text/javascript; charset=utf-8"),
+            ("data.json", "application/json; charset=utf-8"),
+            ("logo.svg", "image/svg+xml"),
+            ("photo.JPEG", "image/jpeg"),
+            ("font.woff2", "font/woff2"),
+            ("clip.mp4", "video/mp4"),
+            ("Dockerfile", "application/octet-stream"),
+            (".hidden", "application/octet-stream"),
+            ("file.", "application/octet-stream"),
+            ("archive.tar.xyz", "application/octet-stream"),
+        ] {
+            assert_eq!(mime_type(Path::new(path)), expected, "{path}");
         }
     }
 
-    let end = if req.is_head {
-        entry.header_length
-    } else {
-        entry.complete_response.len()
-    };
-    stream
-        .write_all(&entry.complete_response[..end])
-        .await
-        .is_ok()
+    #[test]
+    fn byte_ranges() {
+        use ByteRange::{Ignore, Part, Unsatisfiable};
+        for (spec, len, expected) in [
+            ("bytes=0-1", 100, Part(0, 1)),
+            ("bytes=0-", 100, Part(0, 99)),
+            ("bytes=50-500", 100, Part(50, 99)),
+            ("bytes=-10", 100, Part(90, 99)),
+            ("bytes=-500", 100, Part(0, 99)),
+            ("BYTES=3-3", 100, Part(3, 3)),
+            (" bytes= 3-3 ", 100, Part(3, 3)),
+            ("bytes=100-", 100, Unsatisfiable),
+            ("bytes=100-abc", 100, Unsatisfiable),
+            ("bytes=-0", 100, Unsatisfiable),
+            ("bytes=-5", 0, Unsatisfiable),
+            ("bytes=0-", 0, Unsatisfiable),
+            ("bytes=0-1,5-6", 100, Ignore),
+            ("bytes=5-2", 100, Ignore),
+            ("bytes=5-abc", 100, Ignore),
+            ("items=0-1", 100, Ignore),
+            ("bytes=a-b", 100, Ignore),
+            ("bytes=a-5", 100, Ignore),
+            ("bytes=+1-2", 100, Ignore),
+            ("bytes=1-+2", 100, Ignore),
+            ("bytes=-", 100, Ignore),
+            ("bytes=", 100, Ignore),
+            ("bytes", 100, Ignore),
+        ] {
+            assert_eq!(parse_byte_range(spec.as_bytes(), len), expected, "{spec}");
+        }
+    }
 }

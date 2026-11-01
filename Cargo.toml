@@ -3,18 +3,9 @@ name = "kiss"
 version = "0.4.0"
 edition = "2024"
 
-[lib]
-name = "kiss"
-path = "src/lib.rs"
-
-[[bin]]
-name = "kiss"
-path = "src/main.rs"
-
 [dependencies]
 tokio = { version = "1.54", features = ["rt-multi-thread", "net", "io-util", "signal", "time", "macros"] }
 httpdate = "1.0.3"
-rustc-hash = "2.1"
 clap = { version = "4.6", features = ["derive", "env"] }
 
 [dev-dependencies]
