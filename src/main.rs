@@ -562,7 +562,9 @@ async fn handle_connection(mut stream: TcpStream, max_request_size: usize, keepa
 
     // Single per-connection buffer, reused across requests. Pipelined bytes
     // beyond the current request stay in the buffer for the next iteration.
-    let mut buf: Vec<u8> = Vec::with_capacity(max_request_size.min(8192));
+    // Requests rarely exceed 1 KB and larger ones grow it; starting at 8 KB
+    // made musl's allocator mmap and munmap memory for most connections.
+    let mut buf: Vec<u8> = Vec::with_capacity(max_request_size.min(1024));
 
     loop {
         // Read until buf holds a complete header block. The keepalive window
