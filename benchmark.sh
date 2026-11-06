@@ -123,8 +123,9 @@ done
 # Test 3: Cache Performance (304 responses)
 echo -e "\n${BLUE}Testing cache performance (304 Not Modified)...${NC}"
 
-future_date="Wed, 21 Oct 2025 07:28:00 GMT"
-print_results_table "Cache Test (304)" "index.html" "100" "If-Modified-Since: $future_date"
+# The file's own Last-Modified: both servers answer an exact match with 304
+last_modified=$(curl -sI "$KISS_URL/index.html" | tr -d '\r' | sed -n 's/^Last-Modified: //p')
+print_results_table "Cache Test (304)" "index.html" "100" "If-Modified-Since: $last_modified"
 
 # Test 4: Health Endpoint Performance
 echo -e "\n${BLUE}Testing health endpoint performance...${NC}"

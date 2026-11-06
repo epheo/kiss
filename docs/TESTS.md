@@ -1,137 +1,51 @@
 # Testing
 
-KISS includes a comprehensive test suite with over 100 tests covering security, performance, error handling, and production scenarios.
-
-## Test Categories
-
-The test suite is organized into 8 specialized modules:
-
-### Unit Tests (`tests/unit_tests.rs`)
-
-- Path sanitization and normalization (21 tests)
-- MIME type detection for various file extensions
-- Health endpoint functionality and JSON responses
-- Core library functions with edge cases
-
-### Security Tests (`tests/security_tests.rs`)
-
-- Directory traversal attack prevention (21 tests)
-- Binary protection (blocking access to `/kiss` executable)
-- Path sanitization against malicious inputs
-- Security boundary validation
-
-### Integration Tests (`tests/integration_tests.rs`)
-
-- HTTP request/response handling (8 tests)
-- End-to-end server functionality
-- Request parsing and response formatting
-- Static file serving workflows
-
-### Error Handling Tests (`tests/error_handling_tests.rs`)
-
-- File system error scenarios (non-existent files, invalid paths)
-- Connection error handling (timeouts, drops, incomplete requests)
-- Resource exhaustion protection (very long paths, deep traversal)
-- Unicode and special character handling
-
-### HTTP Protocol Tests (`tests/http_protocol_tests.rs`)
-
-- Malformed request handling (invalid methods, versions, formats)
-- Security header validation (CSP, X-Frame-Options, etc.)
-- Content-Type and Content-Length header correctness
-- HTTP edge cases and rapid connection scenarios
-
-### Performance Tests (`tests/performance_tests.rs`)
-
-- Single request latency analysis with statistics
-- Concurrent request throughput at different concurrency levels
-- Memory usage under sustained load
-- Path sanitization and MIME detection benchmarks
-- Performance regression detection
-
-### Production Tests (`tests/production_tests.rs`)
-
-- Graceful shutdown on SIGTERM/SIGINT signals
-- Server startup and port binding validation
-- Connection handling during shutdown
-- Process lifecycle and reliability testing
-
-### Load Tests (`tests/load_tests.rs`)
-
-- Worker pool behavior under high concurrency
-- Connection queuing and bounded channel handling
-- Thread pool saturation scenarios
-
-## Running Tests
-
-### Basic Unit Tests
-
 ```bash
-# Run all unit tests (no server required)
 cargo test
-
-# Run specific test module
-cargo test unit_tests
-cargo test security_tests
 ```
 
-### Integration and Performance Tests
+That runs everything in about two seconds. No server needs to be running and
+no test is `#[ignore]`d.
 
-Most integration and performance tests require a running server and are marked with `#[ignore]`:
+## Layout
 
-```bash
-# Start server in one terminal
-cargo run --release
+- **Unit tests** (in `src/`): MIME type mapping and `Range` header parsing,
+  next to the code they test.
+- **End-to-end tests** (`tests/server.rs`): each test starts the real `kiss`
+  binary (Cargo builds it and exposes its path as `CARGO_BIN_EXE_kiss`) on a
+  free port, with its own temporary content directory, configured through
+  `KISS_*` environment variables as in Kubernetes, and talks raw HTTP to it. Responses are read by `Content-Length`, so keep-alive connections never
+  stall a test.
 
-# Run all tests including server-dependent ones in another terminal
-cargo test -- --include-ignored
+## What the end-to-end tests cover
 
-# Run specific performance benchmarks
-cargo test bench_ -- --include-ignored --nocapture
+- **Serving**: bodies, `Content-Type`, `Content-Length`, `ETag`,
+  `Last-Modified`, `Cache-Control`, `Accept-Ranges` and `X-Content-Type-Options`;
+  directory indexes with and without a trailing slash; query strings;
+  absolute-form request targets; health and readiness probes.
+- **Conditional requests**: `If-None-Match` (weak comparison, lists, `*`, any
+  header case), `If-Modified-Since` (exact, older, newer, malformed), and
+  `If-None-Match` taking precedence.
+- **Ranges**: prefix, suffix and open ranges, clamping, 416, and multi-range or
+  unknown units falling back to 200; `HEAD` with `Range`.
+- **Errors**: 404 (including traversal attempts and a custom `404.html`), 405
+  with `Allow`, 400 for malformed request lines, and 413 for oversized requests,
+  including headers that never terminate.
+- **Connections**: keep-alive, pipelining, `HEAD` never leaking a body,
+  `Connection: close`, HTTP/1.0 with and without keep-alive, idle and
+  incomplete-request timeouts, the keep-alive window restarting after each
+  response, slowly sent requests, and concurrent clients.
+- **Content directory**: symlinks (to files and directories) and files over the
+  50 MB cache limit are never served.
+- **Lifecycle**: graceful shutdown on `SIGTERM` and `SIGINT`, requests on open
+  connections still answered during shutdown, and a clear failure when the port
+  is taken.
+- **Configuration**: `KISS_*` environment variables, the version in the
+  startup log, and exit code 2 for invalid values or any argument.
 
-# Run production tests (requires release binary)
-cargo build --release
-cargo test production_tests -- --include-ignored
-```
+## Benchmarks
 
-### Automated Test Runner (Recommended)
-
-Use the tmux script for automatic setup and execution of all tests:
-
-```bash
-# Run all tests with automatic server setup
-./tests/run_all_tests.sh
-
-# Cleanup when done
-./tests/cleanup_tests.sh
-```
-
-The script will:
-
-1. Build the release binary
-2. Start server from `tests/` directory (serving `tests/content/`) in one tmux window
-3. Run all tests (including server-dependent ones) in another window
-4. Attach you to the tmux session to view results
-
-**Test Content Directory (`tests/content/`)**
-
-- Contains static files for integration testing (server runs from `tests/` and serves `tests/content/`)
-- `test.svg` - SVG file for testing `image/svg+xml` content-type
-- `index.html` - HTML file with links to all test assets
-- `style.css` - CSS file for testing `text/css` content-type  
-- `app.js` - JavaScript file for testing `text/javascript` content-type
-
-### Test Categories by Requirement
-
-**No Server Required:**
-
-- Unit tests (path sanitization, MIME types)
-- Security tests (input validation)
-- Error handling tests (most scenarios)
-
-**Server Required:**
-
-- Integration tests (HTTP functionality)
-- Performance tests (latency, throughput)
-- Production tests (graceful shutdown)
-- Load tests (concurrency behavior)
+`benchmark.sh` compares a running KISS against nginx with
+[wrk](https://github.com/wg/wrk). Point both servers at `tests/content/`, which
+holds the benchmark fixtures (`small.txt`, `medium.txt`, `large.txt`).
+Results are in [PERFORMANCES.md](PERFORMANCES.md).

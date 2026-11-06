@@ -22,15 +22,16 @@ podman run -p 8080:8080 --read-only my-website
 
 ## Configuration
 
-CLI arguments take priority over environment variables, which take priority over defaults.
+KISS is configured through environment variables only and takes no
+command-line arguments. An invalid value stops it at startup.
 
-| Setting | CLI Flag | Environment Variable | Default | Description |
-|---------|----------|---------------------|---------|-------------|
-| Port | `--port` `-p` | `KISS_PORT` | `8080` | Server bind port |
-| Bind IP | `--bind-ip` `-b` | `KISS_BIND_IP` | `0.0.0.0` | IP address to bind |
-| Static Directory | `--static-dir` `-s` | `KISS_STATIC_DIR` | `./content` | Static files directory |
-| Max Request Size | `--max-request-size` `-r` | `KISS_MAX_REQUEST_SIZE` | `8192` | Request size limit (bytes) |
-| Keep-alive Timeout | `--keepalive-timeout-secs` `-k` | `KISS_KEEPALIVE_TIMEOUT` | `5` | Keep-alive timeout (seconds) |
+| Environment Variable | Default | Description |
+|---------------------|---------|-------------|
+| `KISS_PORT` | `8080` | Server bind port |
+| `KISS_BIND_IP` | `0.0.0.0` | IP address to bind |
+| `KISS_STATIC_DIR` | `./content` | Static files directory |
+| `KISS_MAX_REQUEST_SIZE` | `8192` | Request size limit (bytes) |
+| `KISS_KEEPALIVE_TIMEOUT` | `5` | Keep-alive timeout (seconds) |
 
 ## Kubernetes Deployment
 

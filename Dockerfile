@@ -1,35 +1,12 @@
-# Multi-stage build for minimal container
-FROM rust:1.93-alpine AS builder
-
-# Install musl target for static linking
-RUN apk add --no-cache musl-dev
-RUN rustup target add x86_64-unknown-linux-musl
-
-# Set working directory
+# rust:alpine targets musl natively, so the release binary is fully static
+FROM rust:1.99-alpine AS builder
 WORKDIR /app
-
-# Copy Cargo files
-COPY Cargo.toml ./
-
-# Copy source code
+COPY Cargo.toml Cargo.lock ./
 COPY src ./src
+RUN cargo build --release --locked && mkdir -m 755 /content
 
-# Build static binary
-RUN cargo build --release --target x86_64-unknown-linux-musl
-
-RUN mkdir /content && chmod 755 /content
-
-# Back to scratch for final image
 FROM scratch
-
-# Copy the static binary
-COPY --from=builder /app/target/x86_64-unknown-linux-musl/release/kiss /kiss
-
-# Copy content directory
+COPY --from=builder /app/target/release/kiss /kiss
 COPY --from=builder /content /content
-
-# Expose port
 EXPOSE 8080
-
-# Run the server
 ENTRYPOINT ["/kiss"]
