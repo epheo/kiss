@@ -572,6 +572,7 @@ fn fails_when_port_is_taken() {
 
 #[test]
 fn rejects_arguments_and_invalid_settings() {
+    use std::os::unix::ffi::OsStrExt;
     // Configuration is environment-only, so a flag is an error, not ignored
     let (code, stderr) = exit_of(kiss().args(["--port", "9090"]));
     assert_eq!(code, Some(2));
@@ -586,6 +587,13 @@ fn rejects_arguments_and_invalid_settings() {
     ] {
         let (code, stderr) = exit_of(kiss().env(key, value));
         assert_eq!(code, Some(2), "{key}={value}");
+        assert!(stderr.contains(key), "{stderr}");
+    }
+
+    let not_utf8 = std::ffi::OsStr::from_bytes(b"/srv/\xff");
+    for key in ["KISS_PORT", "KISS_STATIC_DIR"] {
+        let (code, stderr) = exit_of(kiss().env(key, not_utf8));
+        assert_eq!(code, Some(2), "{key}");
         assert!(stderr.contains(key), "{stderr}");
     }
 }

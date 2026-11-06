@@ -3,6 +3,7 @@
 //! lookup and a single write.
 
 use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::fs;
 use std::io;
 use std::num::{NonZeroU16, NonZeroU64};
@@ -348,11 +349,15 @@ fn parse_byte_range(spec: &[u8], len: usize) -> ByteRange {
 /// value exits with status 2 instead of silently falling back.
 fn setting<T: FromStr>(name: &str, default: &str) -> T {
     let key = format!("KISS_{name}");
-    let value = std::env::var(&key).unwrap_or_else(|_| default.to_owned());
-    value.parse().unwrap_or_else(|_| {
-        eprintln!("Invalid {key}: {value:?}");
-        std::process::exit(2)
-    })
+    let raw = std::env::var_os(&key);
+    // Non-UTF-8 is invalid too: `env::var` would report it like an unset variable
+    let value = raw.as_deref().map_or(Some(default), OsStr::to_str);
+    value
+        .and_then(|value| value.parse().ok())
+        .unwrap_or_else(|| {
+            eprintln!("Invalid {key}: \"{}\"", raw.unwrap_or_default().display());
+            std::process::exit(2)
+        })
 }
 
 #[tokio::main]
