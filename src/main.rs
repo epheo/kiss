@@ -2,7 +2,7 @@
 //! together with its complete HTTP response, so serving a request is a hash
 //! lookup and a single write.
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 use std::ffi::OsStr;
 use std::fs;
 use std::io;
@@ -117,7 +117,7 @@ impl File {
 
 /// Everything a connection needs, built once at startup
 struct Server {
-    files: HashMap<String, Arc<File>>,
+    files: FxHashMap<String, Arc<File>>,
     health: Prebuilt,
     ready: Prebuilt,
     not_found: Prebuilt,
@@ -131,7 +131,7 @@ impl Server {
         let max_request_size = setting("MAX_REQUEST_SIZE", "8192");
         let keepalive = setting::<NonZeroU64>("KEEPALIVE_TIMEOUT", "5");
         let dir = Path::new(&static_dir);
-        let mut files = HashMap::new();
+        let mut files = FxHashMap::default();
         load_dir(dir, "", &mut files);
         println!("File cache built with {} entries", files.len());
 
@@ -155,7 +155,7 @@ impl Server {
 /// Cache every regular file under `dir`, keyed by URL path. `file_type()` does
 /// not follow symlinks, so links, which could point outside the content
 /// directory, are neither served nor traversed.
-fn load_dir(dir: &Path, url_prefix: &str, files: &mut HashMap<String, Arc<File>>) {
+fn load_dir(dir: &Path, url_prefix: &str, files: &mut FxHashMap<String, Arc<File>>) {
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(e) => return eprintln!("Warning: skipping {}: {e}", dir.display()),

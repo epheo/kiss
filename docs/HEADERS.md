@@ -20,7 +20,7 @@ KISS implements comprehensive HTTP caching headers with file-caching architectur
 
 - **Zero filesystem metadata calls** during request handling
 - **Pre-compiled headers** eliminate string formatting overhead
-- **O(1) cache lookups**: one hash map lookup per request
+- **O(1) cache lookups**: one FxHashMap lookup per request
 - **304 Not Modified** support reduces bandwidth usage
 
 ## Conditional Request Support
@@ -56,10 +56,10 @@ All responses include security headers:
 
 ```rust
 Server {
-    files: HashMap<String, Arc<File>>, // URL path -> file; "/dir" and "/dir/index.html" share one File
+    files: FxHashMap<String, Arc<File>>, // URL path -> file; "/dir" and "/dir/index.html" share one File
     health: Prebuilt,
     ready: Prebuilt,
-    not_found: Prebuilt,               // From 404.html when present
+    not_found: Prebuilt,                 // From 404.html when present
     ...
 }
 
